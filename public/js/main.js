@@ -14,8 +14,8 @@ import {
 import { getSettings, getSetting, setSetting } from './settings.js';
 import { detectIsp } from './geo.js';
 import {
-  submitResult, fetchLeaderboard, fetchPatterns, fetchOutage,
-  renderLeaderboard, renderOutage, PatternsChart, embedFor,
+  submitResult, fetchLeaderboard, fetchPatterns, fetchOutage, fetchCountries,
+  renderLeaderboard, renderCountryBoard, renderOutage, PatternsChart, embedFor,
 } from './intel.js';
 import {
   defaultCaption, drawCard, copyCardToClipboard, downloadCard,
@@ -40,6 +40,7 @@ const els = {
   ispLine: $('ispLine'), ispName: $('ispName'), ispWhere: $('ispWhere'),
   outage: $('outage'),
   intel: $('intel'), intelScope: $('intelScope'), leaderboard: $('leaderboard'),
+  countryBoard: $('countryBoard'),
   patterns: $('patterns'), patternsTip: $('patternsTip'), patternsScope: $('patternsScope'),
   badgeImg: $('badgeImg'), embedMd: $('embedMd'), embedHtml: $('embedHtml'),
   statsLink: $('statsLink'),
@@ -128,18 +129,20 @@ function fillDetails(r) {
   const rows = [
     ['Download avg', `${fmtMbps(r.down)} ${u}`],
     ['Download peak', `${fmtMbps(r.downPeak)} ${u}`],
-    ['Data received', `${fmtBytes(r.downBytes)} in ${r.downDur.toFixed(1)} s · 5 streams`],
+    ['Data received', `${fmtBytes(r.downBytes)} in ${r.downDur.toFixed(1)} s${r.server === 'mlab' ? ' · NDT7 WebSocket' : ' · 5 streams'}`],
     ['Upload avg', `${fmtMbps(r.up)} ${u}`],
     ['Upload peak', `${fmtMbps(r.upPeak)} ${u}`],
-    ['Data sent', `${fmtBytes(r.upBytes)} in ${r.upDur.toFixed(1)} s · 4 streams`],
+    ['Data sent', `${fmtBytes(r.upBytes)} in ${r.upDur.toFixed(1)} s${r.server === 'mlab' ? ' · NDT7 WebSocket' : ' · 4 streams'}`],
     ['Ping (median)', `${fmtMs(r.ping)} ms`],
     ['Jitter', `${fmtMs(r.jitter)} ms`],
     ['Loaded RTT', r.loadedRtt != null ? `${fmtMs(r.loadedRtt)} ms` : '—'],
     ['Packet loss', r.loss != null
-      ? `${fmtPct(r.loss)} % (${r.lossMethod === 'tcp'
-        ? `TCP retransmits, ${r.lossSent} segments under load`
-        : `UDP, ${r.lossReceived}/${r.lossSent} via TURN relay`})`
-      : (r.server === 'local' ? 'not measured for LAN tests' : 'unavailable (no relay reachable)')],
+      ? (r.lossMethod === 'tcp_info'
+        ? `${fmtPct(r.loss)} % (TCP retransmissions)`
+        : (r.lossMethod === 'probe'
+          ? `${fmtPct(r.loss)} % (Network probe, ${r.lossReceived}/${r.lossSent} received)`
+          : `${fmtPct(r.loss)} % (UDP, ${r.lossReceived}/${r.lossSent} via TURN relay)`))
+      : (r.server === 'local' ? 'not measured for LAN tests' : 'unavailable')],
     ['ISP', r.geo?.isp || '—'],
     ['Location', [r.geo?.city, r.geo?.region, r.geo?.postal].filter(Boolean).join(' · ') || '—'],
   ];
@@ -256,7 +259,7 @@ function start() {
       setState('done');
       // Community layer: share (only real-internet tests carry real ISP truth)
       // then refresh the leaderboard/outage/patterns for this connection.
-      if (result.server === 'cloudflare' && result.geo) {
+      if ((result.server === 'cloudflare' || result.server === 'mlab') && result.geo) {
         submitResult(result).finally(() => loadIntel(result.geo));
       } else if (result.geo || currentGeo) {
         loadIntel(result.geo || currentGeo);
@@ -312,10 +315,11 @@ function showIspLine(g) {
 function renderIntelFromCache() {
   if (!lastIntel) return;
   const {
-    lb, pat, out, g, patScope,
+    lb, pat, out, g, patScope, ctry,
   } = lastIntel;
   renderOutage(els.outage, out, g);
   renderLeaderboard(els.leaderboard, lb, g.isp);
+  renderCountryBoard(els.countryBoard, ctry, g);
   // demo:true means the scope has no real community reports yet and the numbers
   // are sample/seed data — label it plainly so it's never mistaken for real
   // crowdsourced data. The server never blends demo and real (see worker.js).
@@ -334,10 +338,11 @@ function renderIntelFromCache() {
 
 async function loadIntel(g) {
   if (!g?.city) { els.intel.hidden = true; return; }
-  let [lb, pat, out] = await Promise.all([
+  let [lb, pat, out, ctry] = await Promise.all([
     fetchLeaderboard({ city: g.city }),
     fetchPatterns({ isp: g.isp, city: g.city }),
     g.isp ? fetchOutage({ isp: g.isp, city: g.city }) : Promise.resolve(null),
+    fetchCountries({}),
   ]);
   let patScope = g.isp || 'All ISPs';
   if (pat && g.isp && pat.scope.samples < 12) {
@@ -349,7 +354,7 @@ async function loadIntel(g) {
     }
   }
   lastIntel = {
-    lb, pat, out, g, patScope,
+    lb, pat, out, g, patScope, ctry,
   };
   renderIntelFromCache();
   const embed = embedFor(g, location.origin);

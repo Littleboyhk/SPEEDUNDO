@@ -50,6 +50,17 @@ export const fetchPatterns = ({ isp, city }) =>
 export const fetchOutage = ({ isp, city }) =>
   getJson(`/api/outage?isp=${encodeURIComponent(isp || '')}&city=${encodeURIComponent(city || '')}`);
 
+export const fetchCountries = ({ country } = {}) =>
+  getJson(`/api/countries?country=${encodeURIComponent(country || '')}`);
+
+// ISO 3166-1 alpha-2 → flag emoji (regional indicator symbols). Falls back to
+// the bare country code when it isn't a 2-letter code.
+function countryFlag(cc) {
+  const code = String(cc || '').toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) return code || '?';
+  return String.fromCodePoint(...[...code].map((c) => 0x1F1E6 + c.charCodeAt(0) - 65));
+}
+
 // ---- outage banner ----------------------------------------------------------
 
 export function renderOutage(el, data, geo) {
@@ -127,6 +138,90 @@ export function renderLeaderboard(el, data, highlightIsp) {
 
     row.append(rank, main, nums, chip);
     el.appendChild(row);
+  });
+}
+
+// ---- country leaderboard -----------------------------------------------------
+
+// One collapsible section per country, ranked by fastest ISP's median download.
+// Each section lists that country's ISPs (rank, bar, down/up/ping/samples,
+// health chip) reusing the city-leaderboard row markup. The viewer's own
+// country + ISP are highlighted.
+export function renderCountryBoard(el, data, geo) {
+  el.textContent = '';
+  if (!data || !data.countries.length) {
+    const p = document.createElement('p');
+    p.className = 'intel-empty';
+    p.textContent = data
+      ? 'No reports yet. Run a test to put your country on the board.'
+      : 'Leaderboard needs the SpeedUndo server — start it with “node server.js”.';
+    el.appendChild(p);
+    return;
+  }
+  const maxDown = Math.max(
+    ...data.countries.flatMap((c) => c.isps.map((i) => i.down || 0)), 1,
+  );
+  const youCc = (geo?.country || '').toUpperCase();
+  const youIsp = (geo?.isp || '').toLowerCase();
+
+  data.countries.forEach((c, ci) => {
+    const det = document.createElement('details');
+    det.className = 'ct-block';
+    if (c.country === youCc || ci === 0) det.open = true;
+
+    const sum = document.createElement('summary');
+    sum.className = 'ct-head';
+    sum.innerHTML = `<span class="ct-flag" aria-hidden="true">${countryFlag(c.country)}</span>`
+      + `<span class="ct-code">${escapeHtml(c.country)}</span>`
+      + `<span class="ct-best">${fmtMbps(c.down)}<i>↓ ${speedUnitLabel()}</i></span>`
+      + `<span class="ct-count">${c.isps.length} isp${c.isps.length === 1 ? '' : 's'} · ${c.samples} tests</span>`
+      + `<span class="ct-chev" aria-hidden="true">▾</span>`;
+    det.appendChild(sum);
+
+    const body = document.createElement('div');
+    body.className = 'ct-body leaderboard';
+    c.isps.forEach((isp, i) => {
+      const s = STATUS[isp.health?.status] || STATUS.unknown;
+      const isYou = c.country === youCc && isp.isp.toLowerCase() === youIsp;
+      const row = document.createElement('article');
+      row.className = 'lb-row';
+      if (isYou) row.classList.add('lb-you');
+
+      const rank = document.createElement('span');
+      rank.className = 'lb-rank';
+      rank.textContent = String(i + 1);
+
+      const main = document.createElement('div');
+      main.className = 'lb-main';
+      const name = document.createElement('div');
+      name.className = 'lb-name';
+      name.innerHTML = `${escapeHtml(isp.isp)}`
+        + (isYou ? ' <span class="lb-youtag">you</span>' : '')
+        + (isp.asn ? ` <span class="lb-asn">AS${isp.asn}</span>` : '');
+      const barWrap = document.createElement('div');
+      barWrap.className = 'lb-bar-wrap';
+      const bar = document.createElement('span');
+      bar.className = 'lb-bar';
+      bar.style.width = `${Math.max(3, ((isp.down || 0) / maxDown) * 100)}%`;
+      barWrap.appendChild(bar);
+      main.append(name, barWrap);
+
+      const nums = document.createElement('div');
+      nums.className = 'lb-nums';
+      nums.innerHTML = `<span class="lb-down">${fmtMbps(isp.down)}<i>↓</i></span>`
+        + `<span>${fmtMbps(isp.up)}<i>↑</i></span>`
+        + `<span>${fmtMs(isp.ping)}<i>ms</i></span>`
+        + `<span>${isp.samples}<i>tests</i></span>`;
+
+      const chip = document.createElement('span');
+      chip.className = `status-chip status-${s.cls}`;
+      chip.innerHTML = `<span aria-hidden="true">${s.icon}</span>${s.label}`;
+
+      row.append(rank, main, nums, chip);
+      body.appendChild(row);
+    });
+    det.appendChild(body);
+    el.appendChild(det);
   });
 }
 

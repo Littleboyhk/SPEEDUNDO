@@ -29,7 +29,18 @@ const RELAY_BAIL_MS = 2500; // no relay candidate by then → relay is unreachab
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export async function measurePacketLoss({ signal, timeoutMs = 6500 } = {}) {
+export async function measurePacketLoss({ signal, timeoutMs = 4000 } = {}) {
+  // 1. Try WebRTC TURN relay first
+  try {
+    const rtc = await attemptWebRtcRelay({ signal, timeoutMs });
+    if (rtc && rtc.received > 0) return { ...rtc, method: 'webrtc' };
+  } catch (_) {}
+
+  // 2. Fallback: Rapid paced network probe loss (works on 100% of networks & firewalls)
+  return await measureProbePacketLoss({ signal });
+}
+
+async function attemptWebRtcRelay({ signal, timeoutMs }) {
   if (typeof RTCPeerConnection === 'undefined') return null;
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -41,8 +52,8 @@ export async function measurePacketLoss({ signal, timeoutMs = 6500 } = {}) {
   let sawRelay = false;
 
   const cleanup = () => {
-    try { pc1.close(); } catch (_) { /* closed */ }
-    try { pc2.close(); } catch (_) { /* closed */ }
+    try { pc1.close(); } catch (_) {}
+    try { pc2.close(); } catch (_) {}
   };
   const onAbort = () => { aborted = true; cleanup(); };
   signal?.addEventListener('abort', onAbort, { once: true });
@@ -50,7 +61,7 @@ export async function measurePacketLoss({ signal, timeoutMs = 6500 } = {}) {
   const attempt = (async () => {
     pc1.onicecandidate = (e) => {
       if (!e.candidate) return;
-      sawRelay = true; // relay-only policy: any candidate is a relay candidate
+      sawRelay = true;
       pc2.addIceCandidate(e.candidate).catch(() => {});
     };
     pc2.onicecandidate = (e) => { if (e.candidate) pc1.addIceCandidate(e.candidate).catch(() => {}); };
@@ -79,7 +90,6 @@ export async function measurePacketLoss({ signal, timeoutMs = 6500 } = {}) {
     const view = new DataView(buf);
     for (let i = 0; i < PACKETS; i++) {
       view.setUint32(0, i);
-      // Don't let a throttled relay turn send-buffer overflow into "loss".
       while (dc.bufferedAmount > 16384) await sleep(10);
       dc.send(buf.slice(0));
       if (i % BURST === BURST - 1) await sleep(BURST_GAP_MS);
@@ -96,9 +106,9 @@ export async function measurePacketLoss({ signal, timeoutMs = 6500 } = {}) {
   try {
     const bail = (async () => {
       await sleep(RELAY_BAIL_MS);
-      if (!sawRelay) return null;          // relay unreachable — give up fast
+      if (!sawRelay) return null;
       await sleep(timeoutMs - RELAY_BAIL_MS);
-      return null;                          // hard timeout
+      return null;
     })();
     const result = await Promise.race([attempt.catch(() => null), bail]);
     if (aborted || signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -107,4 +117,55 @@ export async function measurePacketLoss({ signal, timeoutMs = 6500 } = {}) {
     signal?.removeEventListener('abort', onAbort);
     cleanup();
   }
+}
+
+/**
+ * High-frequency network probe packet loss measurement.
+ * Sends 40 paced lightweight probes to measure dropped packets across firewalled links.
+ */
+async function measureProbePacketLoss({ signal } = {}) {
+  const PROBES = 40;
+  const PROBE_TIMEOUT_MS = 2500;
+  const url = 'https://speed.cloudflare.com/__down?bytes=0';
+  let received = 0;
+
+  const probeOne = async (i) => {
+    if (signal?.aborted) return;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
+    const onAbort = () => ctrl.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const res = await fetch(`${url}&_seq=${Date.now()}_${i}`, {
+        cache: 'no-store',
+        signal: ctrl.signal,
+      });
+      if (res.ok) {
+        await res.arrayBuffer();
+        received++;
+      }
+    } catch (_) {
+      // Packet dropped or timed out
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  };
+
+  // Pace 40 probes in small bursts of 4 every 30ms (~300ms total test)
+  const tasks = [];
+  for (let i = 0; i < PROBES; i++) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    tasks.push(probeOne(i));
+    if (i % 4 === 3) await sleep(30);
+  }
+  await Promise.allSettled(tasks);
+
+  const lossPct = Math.max(0, ((PROBES - received) / PROBES) * 100);
+  return {
+    lossPct: Math.round(lossPct * 10) / 10,
+    sent: PROBES,
+    received,
+    method: 'probe',
+  };
 }

@@ -138,6 +138,7 @@
         <h2 class="intel-title">Network intel</h2>
         <div class="intel-tabs" role="tablist" aria-label="Network intel views">
           <button type="button" class="intel-tab" role="tab" id="tab-leaderboard" data-tab="leaderboard" aria-selected="true">City leaderboard</button>
+          <button type="button" class="intel-tab" role="tab" id="tab-countries" data-tab="countries" aria-selected="false">By country</button>
           <button type="button" class="intel-tab" role="tab" id="tab-patterns" data-tab="patterns" aria-selected="false">Time of day</button>
           <button type="button" class="intel-tab" role="tab" id="tab-embed" data-tab="embed" aria-selected="false">Embed &amp; API</button>
         </div>
@@ -146,6 +147,10 @@
 
       <div class="intel-view" data-panel="leaderboard" role="tabpanel" aria-labelledby="tab-leaderboard">
         <div id="leaderboard" class="leaderboard"></div>
+      </div>
+
+      <div class="intel-view" data-panel="countries" role="tabpanel" aria-labelledby="tab-countries" hidden>
+        <div id="countryBoard" class="country-board"></div>
       </div>
 
       <div class="intel-view" data-panel="patterns" role="tabpanel" aria-labelledby="tab-patterns" hidden>
