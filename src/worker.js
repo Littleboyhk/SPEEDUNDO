@@ -150,16 +150,18 @@ const SELECT_COLS = 'ts, isp, asn, city, region, country, postal, down, up, ping
 // only when a city is given lets the planner use idx_results_city_ts
 // (city=? AND ts>?) — a tight index seek, which is the leaderboard hot path.
 // Columns collate NOCASE, so equality is case-insensitive without LOWER().
-async function filterRecords(env, { city, postal, isp, sinceMs }) {
+async function filterRecords(env, { city, postal, isp, country, sinceMs }) {
   const clean = (s) => (s == null || s === '' ? null : String(s).trim());
   const conds = [];
   const binds = [];
   const c = clean(city);
   const p = clean(postal);
   const i = clean(isp);
+  const co = clean(country);
   if (c) { conds.push('city = ?'); binds.push(c); }
   if (p) { conds.push('postal = ?'); binds.push(p); }
   if (i) { conds.push('isp = ?'); binds.push(i); }
+  if (co) { conds.push('country = ?'); binds.push(co); }
   conds.push('ts >= ?');
   binds.push(sinceMs ? Date.now() - sinceMs : 0);
   const { results } = await env.DB
@@ -280,6 +282,33 @@ function buildLeaderboard(rs) {
   return isps;
 }
 
+// Country leaderboard — group rows by country first, then by ASN/ISP within
+// each country (same grouping rule as buildLeaderboard so one operator's name
+// variants don't split). Countries are ranked by their fastest ISP's median
+// download; ISPs within a country are ranked by their own median download.
+function buildCountryLeaderboard(rs) {
+  const byCountry = new Map();
+  for (const r of rs) {
+    const cc = norm(r.country).toUpperCase();
+    if (!cc) continue; // no country recorded → can't place on a country board
+    if (!byCountry.has(cc)) byCountry.set(cc, []);
+    byCountry.get(cc).push(r);
+  }
+  const countries = [...byCountry.entries()].map(([code, list]) => {
+    const isps = buildLeaderboard(list);
+    const best = isps.reduce((m, i) => Math.max(m, i.down || 0), 0);
+    return {
+      country: code,
+      samples: list.length,
+      down: round1(best),            // fastest ISP's median down (for ranking)
+      medianDown: round1(median(list.map((r) => r.down))),
+      isps,
+    };
+  }).filter((c) => c.isps.length);
+  countries.sort((a, b) => b.down - a.down);
+  return countries;
+}
+
 function buildPatterns(rs) {
   const hours = [];
   for (let h = 0; h < 24; h++) {
@@ -348,6 +377,18 @@ async function handleLeaderboard(env, q) {
   return json({
     scope: { city: city || null, postal: postal || null, windowDays, samples: rows.length },
     isps: buildLeaderboard(rows),
+    demo,
+  });
+}
+
+async function handleCountries(env, q) {
+  const windowDays = Math.min(90, Math.max(1, Number(q.get('window')) || 30));
+  const country = q.get('country');
+  const all = await filterRecords(env, { country, sinceMs: windowDays * DAY });
+  const { rows, demo } = splitDemo(all);
+  return json({
+    scope: { country: country || null, windowDays, samples: rows.length },
+    countries: buildCountryLeaderboard(rows),
     demo,
   });
 }
@@ -443,6 +484,8 @@ async function handleApi(request, env, url) {
       return handleSubmit(request, env);
     case '/api/leaderboard':
       return handleLeaderboard(env, q);
+    case '/api/countries':
+      return handleCountries(env, q);
     case '/api/patterns':
       return handlePatterns(env, q);
     case '/api/outage':

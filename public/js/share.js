@@ -176,35 +176,88 @@ function drawMiniGauge(ctx, cx, cy, r, result, t) {
   const frac = v <= 0 ? 0
     : (i + (v - stops[i]) / (stops[i + 1] - stops[i])) / (stops.length - 1);
 
+  // Background arc track
   ctx.lineCap = 'round';
   ctx.beginPath();
   ctx.arc(cx, cy, r, start, start + sweep);
   ctx.strokeStyle = t.hairline;
-  ctx.lineWidth = 16;
+  ctx.lineWidth = 14;
   ctx.stroke();
 
-  ctx.beginPath();
-  ctx.arc(cx, cy, r, start, start + sweep * frac);
-  const grad = ctx.createLinearGradient(cx - r, cy, cx + r, cy);
-  grad.addColorStop(0, t.rx);
-  grad.addColorStop(1, t.rxGlow || t.rx);
-  ctx.strokeStyle = grad;
-  ctx.lineWidth = 16;
-  ctx.stroke();
+  // Progress arc
+  if (frac > 0.001) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, start, start + sweep * frac);
+    const grad = ctx.createLinearGradient(cx - r, cy, cx + r, cy);
+    grad.addColorStop(0, t.rx);
+    grad.addColorStop(1, t.rxGlow || t.rx);
+    ctx.strokeStyle = grad;
+    ctx.lineWidth = 14;
+    ctx.stroke();
+  }
 
-  // needle: center pivot, tip short of the arc (mirrors the app needle)
+  // Ticks and scale numbers (0, 1, 5, 10, 20, 50, 100, 250, 500, 1000)
+  const n = stops.length - 1;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = '600 17px "IBM Plex Mono", ui-monospace, monospace';
+
+  for (let sIdx = 0; sIdx <= n; sIdx++) {
+    const angle = start + (sweep * sIdx) / n;
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+
+    // Major tick on the outside of the arc
+    ctx.beginPath();
+    ctx.moveTo(cx + cos * (r + 8), cy + sin * (r + 8));
+    ctx.lineTo(cx + cos * (r + 19), cy + sin * (r + 19));
+    ctx.strokeStyle = t.muted;
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Scale number inside the arc
+    ctx.fillStyle = t.ink2 || t.muted;
+    ctx.fillText(String(stops[sIdx]), cx + cos * (r - 30), cy + sin * (r - 30));
+
+    // Minor tick between segments
+    if (sIdx < n) {
+      const am = start + (sweep * (sIdx + 0.5)) / n;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(am) * (r + 8), cy + Math.sin(am) * (r + 8));
+      ctx.lineTo(cx + Math.cos(am) * (r + 15), cy + Math.sin(am) * (r + 15));
+      ctx.strokeStyle = t.muted;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  // Needle: center pivot, tip pointing to the measured download speed
   const a = start + sweep * frac;
-  const tip = r - 34;
+  const tip = r - 36;
   ctx.beginPath();
   ctx.moveTo(cx, cy);
   ctx.lineTo(cx + Math.cos(a) * tip, cy + Math.sin(a) * tip);
   ctx.strokeStyle = t.ink;
   ctx.lineWidth = 5;
   ctx.stroke();
+
+  // Glow dot at needle tip
   ctx.beginPath();
-  ctx.arc(cx + Math.cos(a) * tip, cy + Math.sin(a) * tip, 6, 0, Math.PI * 2);
+  ctx.arc(cx + Math.cos(a) * tip, cy + Math.sin(a) * tip, 7, 0, Math.PI * 2);
   ctx.fillStyle = t.rxGlow || t.rx;
   ctx.fill();
+
+  // Center speed numeral & unit (mirroring the app gauge hero)
+  const downVal = fmtMbps(result.down);
+  ctx.fillStyle = t.ink;
+  ctx.font = '700 44px "Space Grotesk", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(downVal, cx, cy - 8);
+
+  ctx.fillStyle = t.muted;
+  ctx.font = '600 16px "IBM Plex Mono", ui-monospace, monospace';
+  ctx.fillText(speedUnitLabel(), cx, cy + 28);
 }
 
 /* ---- share actions ----------------------------------------------------------- */

@@ -14,8 +14,16 @@
 import { median, meanAbsDiff } from './format.js';
 import { detectIsp } from './geo.js';
 import { measurePacketLoss } from './rtc.js';
+import { discoverMlabServer, measureMlabPing, runMlabDownload, runMlabUpload } from './ndt7.js';
 
 export const SERVERS = [
+  {
+    id: 'mlab',
+    label: 'M-Lab (Google / NDT7)',
+    hasMeta: true,
+    internet: true,
+    protocol: 'ndt7',
+  },
   {
     id: 'cloudflare',
     label: 'Cloudflare edge',
@@ -55,6 +63,12 @@ const LOADED_PING_GAP_MS = 750;
 const PHASE_SETTLE_MS = 300;
 const STREAM_RETRY_MS = 400;    // backoff after a transient stream error
 const PHASE_GRACE_MS = 4000;    // watchdog: reap sockets hung past the window
+// Headline = mean of the per-second steady-state rates (post TCP ramp), not a
+// byte/time average. A byte/time average drifts for the whole window when the
+// link is still warming up or gently throttling (the "number won't settle"
+// complaint); averaging per-second rates converges on the achieved rate — the
+// number the line is actually sustaining, like speedtest.net reports.
+const STEADY_SAMPLE_MS = 1000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -68,25 +82,6 @@ function randomBlob(size) {
   // which the public speed-test endpoints are not guaranteed to answer.
   return new Blob([buf], { type: 'text/plain' });
 }
-
-// Cloudflare's cfL4 server-timing exposes the server-side TCP socket counters
-// for our own download connections — real packet loss on the saturated path.
-// Counters are cumulative per connection (cid); headers arrive before the
-// body, so only a LATER request on the same reused socket sees the transfer.
-function parseCfL4(header) {
-  if (!header || !header.includes('cfL4')) return null;
-  const num = (k) => {
-    const m = header.match(new RegExp(`[?&]${k}=(\\d+)`));
-    return m ? Number(m[1]) : null;
-  };
-  const cid = header.match(/[?&]cid=([0-9a-f]+)/)?.[1];
-  const sent = num('sent');
-  if (!cid || sent == null) return null;
-  return { cid, sent, retrans: num('retrans') || 0, lost: num('lost') || 0 };
-}
-
-const TCP_MIN_SEGMENTS = 200; // below this the loss figure would be noise
-const TCP_PROBE_BYTES = 4e6;  // completed transfer that feeds the counters
 
 class PhaseError extends Error {
   constructor(phase, message) {
@@ -154,69 +149,15 @@ export class SpeedTest {
       geo: null, // {isp, asn, city, region, country, postal} from geo.js
     };
     try {
-      this.emit('phase', 'meta');
       // ISP/city lookup runs alongside the whole test; awaited before 'done'.
       const geoPromise = detectIsp({ signal: this.signal })
         .then((g) => { if (g) this.emit('isp', g); return g; })
         .catch(() => null);
-      result.meta = await this.fetchMeta();
-      if (result.meta) this.emit('meta', result.meta);
 
-      this.emit('phase', 'ping');
-      const { ping, jitter } = await this.pingPhase();
-      result.ping = ping;
-      result.jitter = jitter;
-
-      await sleep(PHASE_SETTLE_MS);
-      this.emit('phase', 'download');
-      const down = await this.throughputPhase('down');
-      Object.assign(result, {
-        down: down.mbps, downPeak: down.peak,
-        downBytes: down.bytes, downDur: down.dur,
-        loadedRtt: down.loadedRtt,
-      });
-
-      await sleep(PHASE_SETTLE_MS);
-      this.emit('phase', 'upload');
-      const up = await this.throughputPhase('up');
-      Object.assign(result, {
-        up: up.mbps, upPeak: up.peak, upBytes: up.bytes, upDur: up.dur,
-      });
-
-      // Packet loss — internet targets only (for a LAN test the relay path
-      // would say nothing about the line under test). Primary: real UDP loss
-      // through a TURN relay. Fallback (UDP blocked / no relay candidates):
-      // TCP retransmit counters from Cloudflare's cfL4 server-timing on our
-      // own saturated download sockets. Null only when both are unavailable.
-      if (this.server.internet) {
-        this.emit('phase', 'loss');
-        const loss = await measurePacketLoss({ signal: this.signal });
-        if (loss) {
-          result.loss = Math.round(loss.lossPct * 100) / 100;
-          result.lossSent = loss.sent;
-          result.lossReceived = loss.received;
-          result.lossMethod = 'webrtc';
-          this.emit('loss', { ...loss, method: 'webrtc' });
-        } else if (down.tcp && down.tcp.sent > 0) {
-          const pct = (down.tcp.retrans / down.tcp.sent) * 100;
-          result.loss = Math.round(pct * 100) / 100;
-          result.lossSent = down.tcp.sent;
-          result.lossReceived = down.tcp.sent - down.tcp.retrans;
-          result.lossMethod = 'tcp';
-          this.emit('loss', {
-            lossPct: pct, sent: down.tcp.sent,
-            received: result.lossReceived, method: 'tcp',
-          });
-        } else {
-          this.emit('loss', null);
-        }
+      if (this.server.protocol === 'ndt7') {
+        return await this.runNdt7(result, geoPromise);
       }
-
-      result.geo = await geoPromise;
-
-      this.emit('phase', 'done');
-      this.emit('done', result);
-      return result;
+      return await this.runHttp(result, geoPromise);
     } catch (err) {
       if (this.signal.aborted || err?.name === 'AbortError') {
         this.emit('aborted');
@@ -226,6 +167,138 @@ export class SpeedTest {
       return null;
     } finally {
       this.running = false;
+    }
+  }
+
+  // ---- HTTP / Cloudflare protocol runner ----------------------------------
+
+  async runHttp(result, geoPromise) {
+    this.emit('phase', 'meta');
+    result.meta = await this.fetchMeta();
+    if (result.meta) this.emit('meta', result.meta);
+
+    this.emit('phase', 'ping');
+    const { ping, jitter } = await this.pingPhase();
+    result.ping = ping;
+    result.jitter = jitter;
+
+    await sleep(PHASE_SETTLE_MS);
+    this.emit('phase', 'download');
+    const down = await this.throughputPhase('down');
+    Object.assign(result, {
+      down: down.mbps, downPeak: down.peak,
+      downBytes: down.bytes, downDur: down.dur,
+      loadedRtt: down.loadedRtt,
+    });
+
+    await sleep(PHASE_SETTLE_MS);
+    this.emit('phase', 'upload');
+    const up = await this.throughputPhase('up');
+    Object.assign(result, {
+      up: up.mbps, upPeak: up.peak, upBytes: up.bytes, upDur: up.dur,
+    });
+
+    if (this.server.internet) {
+      this.emit('phase', 'loss');
+      const loss = await measurePacketLoss({ signal: this.signal });
+      if (loss) {
+        result.loss = Math.round(loss.lossPct * 100) / 100;
+        result.lossSent = loss.sent;
+        result.lossReceived = loss.received;
+        result.lossMethod = 'webrtc';
+        this.emit('loss', { ...loss, method: 'webrtc' });
+      } else {
+        this.emit('loss', null);
+      }
+    }
+
+    result.geo = await geoPromise;
+    this.emit('phase', 'done');
+    this.emit('done', result);
+    return result;
+  }
+
+  // ---- M-Lab NDT7 protocol runner -----------------------------------------
+
+  async runNdt7(result, geoPromise) {
+    try {
+      this.emit('phase', 'meta');
+      const mlabServer = await discoverMlabServer({ signal: this.signal });
+      result.meta = {
+        colo: mlabServer.city,
+        city: mlabServer.city,
+        country: mlabServer.country,
+        machine: mlabServer.machine,
+        serverName: `M-Lab (${mlabServer.city})`,
+      };
+      if (result.meta) this.emit('meta', result.meta);
+
+      this.emit('phase', 'ping');
+      const { ping, jitter } = await measureMlabPing(mlabServer, {
+        emit: this.emit.bind(this),
+        signal: this.signal,
+      });
+      result.ping = ping;
+      result.jitter = jitter;
+
+      await sleep(PHASE_SETTLE_MS);
+      this.emit('phase', 'download');
+      const down = await runMlabDownload(mlabServer, {
+        emit: this.emit.bind(this),
+        signal: this.signal,
+      });
+      Object.assign(result, {
+        down: down.mbps,
+        downPeak: down.peak,
+        downBytes: down.bytes,
+        downDur: down.dur,
+        loadedRtt: down.loadedRtt,
+      });
+
+      await sleep(PHASE_SETTLE_MS);
+      this.emit('phase', 'upload');
+      const up = await runMlabUpload(mlabServer, {
+        emit: this.emit.bind(this),
+        signal: this.signal,
+      });
+      Object.assign(result, {
+        up: up.mbps,
+        upPeak: up.peak,
+        upBytes: up.bytes,
+        upDur: up.dur,
+      });
+
+      // Packet loss: prefer TCPInfo retransmit metric if reported, otherwise relay
+      if (down.loss != null) {
+        result.loss = Math.round(down.loss * 100) / 100;
+        result.lossMethod = 'tcp_info';
+        this.emit('loss', { lossPct: result.loss, method: 'tcp_info' });
+      } else if (this.server.internet) {
+        this.emit('phase', 'loss');
+        const loss = await measurePacketLoss({ signal: this.signal });
+        if (loss) {
+          result.loss = Math.round(loss.lossPct * 100) / 100;
+          result.lossSent = loss.sent;
+          result.lossReceived = loss.received;
+          result.lossMethod = 'webrtc';
+          this.emit('loss', { ...loss, method: 'webrtc' });
+        } else {
+          this.emit('loss', null);
+        }
+      }
+
+      result.geo = await geoPromise;
+      this.emit('phase', 'done');
+      this.emit('done', result);
+      return result;
+    } catch (err) {
+      if (this.signal.aborted || err?.name === 'AbortError') throw err;
+      console.warn('M-Lab endpoint rate limited or unavailable, falling back to Cloudflare edge:', err);
+      // Seamlessly fall back to Cloudflare edge so the test succeeds
+      const cfServer = SERVERS.find((s) => s.id === 'cloudflare') || SERVERS[1];
+      this.server = cfServer;
+      result.server = 'cloudflare';
+      return await this.runHttp(result, geoPromise);
     }
   }
 
@@ -325,12 +398,14 @@ export class SpeedTest {
     const sampler = setInterval(() => {
       const now = performance.now();
       const t = (now - start) / 1000;
-      const prev = samples[samples.length - 1] || { t: 0, cum: 0 };
-      const dt = t - prev.t;
+      samples.push({ t, cum: bytes });
+
+      // 400ms sliding window prevents momentary ACK pauses from causing needle oscillation
+      const ref = samples[Math.max(0, samples.length - 5)] || { t: 0, cum: 0 };
+      const dt = t - ref.t;
       if (dt <= 0) return;
-      const v = ((bytes - prev.cum) * 8) / dt / 1e6;
-      samples.push({ t, v, cum: bytes });
-      ema = ema === 0 ? v : ema + 0.25 * (v - ema);
+      const v = ((bytes - ref.cum) * 8) / dt / 1e6;
+      ema = ema === 0 ? v : ema + 0.2 * (v - ema);
       this.emit('sample', kind, t, v);
       this.emit('live', kind, ema);
     }, SAMPLE_MS);
@@ -346,17 +421,9 @@ export class SpeedTest {
     })() : Promise.resolve();
 
     const workers = [];
-    // Per-connection cumulative TCP counters, newest snapshot per cid.
-    const tcpMap = isDown ? new Map() : null;
-    const recordTcp = tcpMap ? (header) => {
-      const t = parseCfL4(header);
-      if (t && (!tcpMap.has(t.cid) || t.sent > tcpMap.get(t.cid).sent)) {
-        tcpMap.set(t.cid, t);
-      }
-    } : null;
     for (let i = 0; i < streams; i++) {
       workers.push(isDown
-        ? this.downStream(counter, deadline, recordTcp, phase.signal, lastErr)
+        ? this.downStream(counter, deadline, phase.signal, lastErr)
         : this.upStream(counter, deadline, phase.signal, lastErr));
     }
     await Promise.allSettled(workers);
@@ -377,11 +444,30 @@ export class SpeedTest {
     // no change in behaviour there.
     const dur = ((bytes > 0 ? lastByteAt : end) - start) / 1000;
 
-    // Steady-state figure: bytes moved after the ramp, over that time.
+    // Steady-state headline: collapse the 100 ms samples into 1 s per-second
+    // rates, drop the TCP ramp (first ~1.5 s), and average the rest. Per-second
+    // bins weight every steady second equally, so the figure converges on the
+    // sustained rate instead of creeping as a long byte/time average would.
     const rampSec = Math.min(RAMP_SEC, dur * 0.3);
-    let rampCum = 0;
-    for (const s of samples) { if (s.t <= rampSec) rampCum = s.cum; else break; }
-    const mbps = ((bytes - rampCum) * 8) / (dur - rampSec) / 1e6;
+    const perSec = [];
+    for (let i = 1; i < samples.length; i++) {
+      const a = samples[i - 1];
+      const b = samples[i];
+      if (b.t <= rampSec) continue;             // still in the ramp
+      const dt = b.t - a.t;
+      if (dt <= 0) continue;
+      perSec.push(((b.cum - a.cum) * 8) / dt / 1e6);
+    }
+    // Coalesce the 100 ms bins into ~1 s bins for a stable figure.
+    const bins = [];
+    for (let i = 0; i < perSec.length; i += Math.round(STEADY_SAMPLE_MS / SAMPLE_MS)) {
+      const slice = perSec.slice(i, i + Math.round(STEADY_SAMPLE_MS / SAMPLE_MS));
+      if (slice.length) bins.push(slice.reduce((x, y) => x + y, 0) / slice.length);
+    }
+    const steady = bins.length ? bins : perSec;
+    const mbps = steady.length
+      ? steady.reduce((x, y) => x + y, 0) / steady.length
+      : ((bytes * 8) / dur / 1e6); // degenerate (very short window) fallback
 
     // Peak over a 3-sample moving average (raw 100 ms samples are spiky).
     let peak = 0;
@@ -390,38 +476,13 @@ export class SpeedTest {
       if (avg > peak) peak = avg;
     }
 
-    // TCP view of the download path. The stream sockets die cancelled (their
-    // 25 MB bodies rarely complete), so instead: transfer a small payload to
-    // COMPLETION, then issue a 0-byte probe — the probe reuses the now-idle
-    // socket and its header carries that connection's cumulative counters,
-    // including the completed transfer. Dedupe by cid guards double-counting.
-    let tcp = null;
-    if (recordTcp && !this.signal.aborted) {
-      const probe = this.childSignal(8000); // best-effort; never stalls the test
-      try {
-        const feed = await fetch(this.server.down(TCP_PROBE_BYTES), {
-          cache: 'no-store', signal: probe.signal,
-        });
-        await feed.arrayBuffer(); // must complete so the socket goes idle
-        recordTcp(feed.headers.get('server-timing'));
-        for (let i = 0; i < 2; i++) {
-          const res = await fetch(this.server.down(0), { cache: 'no-store', signal: probe.signal });
-          recordTcp(res.headers.get('server-timing'));
-        }
-      } catch (_) { /* probe is best-effort */ } finally {
-        probe.release();
-      }
-      if (tcpMap.size) {
-        const sum = [...tcpMap.values()].reduce(
-          (a, s) => ({ sent: a.sent + s.sent, retrans: a.retrans + s.retrans, lost: a.lost + s.lost }),
-          { sent: 0, retrans: 0, lost: 0 },
-        );
-        if (sum.sent >= TCP_MIN_SEGMENTS) tcp = sum;
-      }
-    }
-
+    // TCP packet-loss fallback was removed: it ran an 8 s post-phase download
+    // (a hidden extra transfer after the download window), which polluted the
+    // trace and delayed upload. Packet loss already has the WebRTC primary;
+    // when that is unavailable we simply report loss as unavailable rather
+    // than burn another multi-second transfer on a degraded TCP estimate.
     return {
-      mbps, peak: peak || mbps, bytes, dur, tcp,
+      mbps, peak: peak || mbps, bytes, dur, tcp: null,
       loadedRtt: loaded.length ? median(loaded) : null,
     };
   }
@@ -429,14 +490,13 @@ export class SpeedTest {
   // A stream survives transient errors: one failed request logs the reason,
   // backs off briefly, and tries again while the window is open — a single
   // hiccup on a flaky link no longer kills a whole stream (or the phase).
-  async downStream(counter, deadline, recordTcp, phaseSignal, lastErr) {
+  async downStream(counter, deadline, phaseSignal, lastErr) {
     while (performance.now() < deadline && !phaseSignal.aborted) {
       try {
         const res = await fetch(this.server.down(DOWN_REQUEST_BYTES), {
           cache: 'no-store', signal: phaseSignal,
         });
         if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
-        if (recordTcp) recordTcp(res.headers.get('server-timing'));
         const reader = res.body.getReader();
         try {
           for (;;) {
