@@ -11,7 +11,8 @@
     "db:create": "wrangler d1 create speedundo",
     "db:migrate:local": "wrangler d1 migrations apply speedundo --local",
     "db:migrate": "wrangler d1 migrations apply speedundo --remote",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "test": "node scripts/test-security.mjs && node scripts/test-worker-security.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

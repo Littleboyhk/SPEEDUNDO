@@ -18,26 +18,51 @@
  * isolate across requests — module globals would leak between users).
  */
 
-const MAX_DOWN = 1e9;        // 1 GB cap per /down request (from server.js)
+const MAX_DOWN = 50_000_000; // 50 MB cap per /down request (was 1 GB)
 const MAX_RECORDS = 20000;   // community store cap (from server.js)
 const DAY = 86400000;
 
-/* ---- CORS (verbatim contract from server.js) ------------------------------ */
+/* ---- Security & CORS ----------------------------------------------------- */
 
-function corsHeaders() {
+function securityHeaders(extra = {}) {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'SAMEORIGIN',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    ...extra,
+  };
+}
+
+function escapeXml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function corsHeaders(request) {
+  const origin = request?.headers?.get('Origin');
+  const host = request?.headers?.get('Host');
+  const isSameOrLocal = Boolean(origin && host && (
+    origin.includes(host) || origin.includes('localhost') || origin.includes('127.0.0.1')
+  ));
+  const exposed = isSameOrLocal
+    ? 'cf-meta-ip, cf-meta-colo, content-length'
+    : 'cf-meta-colo, content-length';
+
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Expose-Headers': 'cf-meta-ip, cf-meta-colo, content-length',
+    'Access-Control-Expose-Headers': exposed,
+    ...securityHeaders(),
   };
 }
 
-function json(obj, { status = 200, headers = {} } = {}) {
+function json(obj, { status = 200, headers = {}, request = null } = {}) {
   return new Response(JSON.stringify(obj), {
     status,
     headers: {
-      ...corsHeaders(),
+      ...corsHeaders(request),
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
       ...headers,
@@ -62,7 +87,7 @@ function handleDown(request, url) {
   const n = Math.max(0, Math.min(MAX_DOWN, Number.isFinite(parsed) ? parsed : 0));
 
   const headers = {
-    ...corsHeaders(),
+    ...corsHeaders(request),
     'Content-Type': 'application/octet-stream',
     'Content-Length': String(n),
     'Cache-Control': 'no-store, no-transform',
@@ -131,7 +156,7 @@ async function handleUp(request) {
 
   // edgeBuffered flags that any server-side timing would be unreliable here, so
   // consumers know `received` is the only meaningful field.
-  return json({ received, edgeBuffered: true });
+  return json({ received, edgeBuffered: true }, { request });
 }
 
 /* ---- data store ----------------------------------------------------------- */
@@ -333,19 +358,47 @@ const cleanNum = (v, lo, hi) => {
 
 /* ---- API handlers --------------------------------------------------------- */
 
+// Rate limiter for /api/submit: max 5 submissions per 5 minutes per IP
+const submitRateLimits = new Map();
+const SUBMIT_WINDOW_MS = 5 * 60 * 1000;
+const SUBMIT_MAX_PER_WINDOW = 5;
+
+function isSubmitRateLimited(ip) {
+  if (!ip) return false;
+  const now = Date.now();
+  const times = submitRateLimits.get(ip) || [];
+  const recent = times.filter((t) => now - t < SUBMIT_WINDOW_MS);
+  if (recent.length >= SUBMIT_MAX_PER_WINDOW) {
+    return true;
+  }
+  recent.push(now);
+  submitRateLimits.set(ip, recent);
+  if (submitRateLimits.size > 2000) {
+    for (const [k, v] of submitRateLimits.entries()) {
+      if (!v.some((t) => now - t < SUBMIT_WINDOW_MS)) submitRateLimits.delete(k);
+    }
+  }
+  return false;
+}
+
 async function handleSubmit(request, env) {
+  const clientIp = (request.headers.get('CF-Connecting-IP') || '').replace(/^::ffff:/, '');
+  if (clientIp && isSubmitRateLimited(clientIp)) {
+    return json({ ok: false, error: 'Too many submissions. Please wait.' }, { status: 429, request });
+  }
+
   // Reject oversized bodies before buffering (server.js capped at 10 KB).
   const declared = Number(request.headers.get('content-length') || 0);
   if (declared > 10000) {
-    return json({ ok: false, error: 'Body too large.' }, { status: 413 });
+    return json({ ok: false, error: 'Body too large.' }, { status: 413, request });
   }
   const body = await request.text();
   if (body.length > 10000) {
-    return json({ ok: false, error: 'Body too large.' }, { status: 413 });
+    return json({ ok: false, error: 'Body too large.' }, { status: 413, request });
   }
   let j;
   try { j = JSON.parse(body); } catch (_) {
-    return json({ ok: false, error: 'Body must be JSON.' }, { status: 400 });
+    return json({ ok: false, error: 'Body must be JSON.' }, { status: 400, request });
   }
   const rec = {
     ts: Date.now(),
@@ -361,11 +414,14 @@ async function handleSubmit(request, env) {
     jitter: cleanNum(j.jitter, 0, 10000),
     loss: cleanNum(j.loss, 0, 100),
   };
+  if (j.ts && typeof j.ts === 'number' && Math.abs(Date.now() - j.ts) < 3600000) {
+    rec.ts = j.ts;
+  }
   if (!rec.isp || !rec.city || rec.down == null) {
-    return json({ ok: false, error: 'isp, city and down are required.' }, { status: 400 });
+    return json({ ok: false, error: 'isp, city and down are required.' }, { status: 400, request });
   }
   await insertRecord(env, rec);
-  return json({ ok: true, stored: true });
+  return json({ ok: true, stored: true }, { request });
 }
 
 async function handleLeaderboard(env, q) {
@@ -436,7 +492,7 @@ async function handleStats(env, q) {
   });
 }
 
-async function handleBadge(env, q) {
+async function handleBadge(env, q, request) {
   const city = q.get('city') || '';
   const isp = q.get('isp') || '';
   const metric = q.get('metric') === 'up' ? 'up' : 'down';
@@ -444,15 +500,17 @@ async function handleBadge(env, q) {
   const { rows, demo } = splitDemo(all);
   const value = median(rows.map((r) => r[metric]));
   const h = healthFor(rows);
-  const label = (isp || city || 'internet').slice(0, 24);
+  const rawLabel = (isp || city || 'internet').slice(0, 24);
   const arrow = metric === 'down' ? '↓' : '↑';
   // Never present demo numbers as real on an externally-embedded badge.
   const suffix = demo ? ' (sample)' : '';
-  const text = value == null ? 'no data' : `${round1(value)} Mbps ${arrow}${suffix}`;
+  const rawText = value == null ? 'no data' : `${round1(value)} Mbps ${arrow}${suffix}`;
   const color = { good: '#0CA30C', warning: '#B08000', serious: '#C25E2E', critical: '#D03B3B', unknown: '#666F7D' }[h.status];
-  const lw = 60 + label.length * 7.2;
-  const vw = 24 + text.length * 7.2;
+  const lw = 60 + rawLabel.length * 7.2;
+  const vw = 24 + rawText.length * 7.2;
   const w = Math.round(lw + vw);
+  const label = escapeXml(rawLabel);
+  const text = escapeXml(rawText);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="24" role="img" aria-label="${label}: ${text}">
   <linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-opacity=".08"/><stop offset="1" stop-opacity=".18" stop-color="#000"/></linearGradient>
   <rect rx="4" width="${w}" height="24" fill="#0D1420"/>
@@ -466,9 +524,11 @@ async function handleBadge(env, q) {
   return new Response(svg, {
     status: 200,
     headers: {
-      ...corsHeaders(),
+      ...corsHeaders(request),
       'Content-Type': 'image/svg+xml; charset=utf-8',
       'Cache-Control': 'public, max-age=300',
+      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+      'X-Content-Type-Options': 'nosniff',
     },
   });
 }
@@ -493,9 +553,9 @@ async function handleApi(request, env, url) {
     case '/api/stats':
       return handleStats(env, q);
     case '/api/badge.svg':
-      return handleBadge(env, q);
+      return handleBadge(env, q, request);
     default:
-      return json({ ok: false, error: 'Unknown API path.' }, { status: 404 });
+      return json({ ok: false, error: 'Unknown API path.' }, { status: 404, request });
   }
 }
 
@@ -512,7 +572,7 @@ export default {
 
     // CORS preflight — every route shares the same policy.
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
     // Speed-test targets.

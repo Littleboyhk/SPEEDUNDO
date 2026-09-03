@@ -265,7 +265,7 @@ export async function runMlabDownload(server, { emit, signal }) {
         const dt = t - ref.t;
         if (dt <= 0) return;
         const v = ((totalBytes - ref.cum) * 8) / dt / 1e6;
-        ema = ema === 0 ? v : ema + 0.2 * (v - ema);
+        ema = ema === 0 ? v : ema + 0.18 * (v - ema);
         emit?.('sample', 'down', t, v);
         emit?.('live', 'down', ema);
       }, SAMPLE_MS);
@@ -307,36 +307,40 @@ export async function runMlabDownload(server, { emit, signal }) {
 /**
  * Execute NDT7 WebSocket Upload test.
  */
-export async function runMlabUpload(server, { emit, signal }) {
+export async function runMlabUpload(server, { emit, signal, streams = 4 }) {
   return new Promise((resolve, reject) => {
-    let ws = null;
+    const numStreams = Math.max(1, Math.min(streams, 4));
     let sampler = null;
-    let pumpTimer = null;
     let durationTimer = null;
     let settled = false;
 
-    let totalSent = 0;
-    let serverReportedBytes = 0;
+    // Parallel stream state objects (multi-connection parallel streams matching Ookla Multi mode)
+    const streamState = Array.from({ length: numStreams }, () => ({
+      ws: null,
+      totalSent: 0,
+      serverBytes: 0,
+      chunkSize: 8192,
+      chunk: randomBuffer(8192),
+      pumpTimer: null,
+    }));
+
     const start = performance.now();
     const samples = [];
     let ema = 0;
 
-    // Steady 32 KB chunk size to avoid buffer burst spikes
-    const CHUNK_SIZE = 32768;
-    const TARGET_BUFFER = 256 * 1024;
-    const chunk = randomBuffer(CHUNK_SIZE);
-
     const cleanup = () => {
       if (sampler) clearInterval(sampler);
-      if (pumpTimer) clearTimeout(pumpTimer);
       if (durationTimer) clearTimeout(durationTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
-      if (ws) {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onerror = null;
-        ws.onclose = null;
-        try { ws.close(); } catch (_) {}
+      for (const st of streamState) {
+        if (st.pumpTimer) clearTimeout(st.pumpTimer);
+        if (st.ws) {
+          st.ws.onopen = null;
+          st.ws.onmessage = null;
+          st.ws.onerror = null;
+          st.ws.onclose = null;
+          try { st.ws.close(); } catch (_) {}
+        }
       }
     };
 
@@ -347,28 +351,45 @@ export async function runMlabUpload(server, { emit, signal }) {
 
       const end = performance.now();
       const dur = Math.max((end - start) / 1000, 0.1);
-      const effectiveBytes = serverReportedBytes || Math.max(totalSent - (ws ? ws.bufferedAmount : 0), 0);
 
+      let totalServerBytes = 0;
+      let totalSentAll = 0;
+      let totalBufferedAll = 0;
+      for (const st of streamState) {
+        totalServerBytes += (st.serverBytes || 0);
+        totalSentAll += st.totalSent;
+        totalBufferedAll += (st.ws ? st.ws.bufferedAmount : 0);
+      }
+
+      const effectiveBytes = totalServerBytes || Math.max(totalSentAll - totalBufferedAll, 0);
       if (effectiveBytes === 0) {
         return reject(new Error('No upload data moved to M-Lab server.'));
       }
 
-      // Calculate steady-state Mbps excluding ramp-up
+      // Calculate steady-state throughput excluding initial slow-start ramp
       const rampSec = Math.min(RAMP_SEC, dur * 0.3);
-      const perSec = [];
-      for (let i = 1; i < samples.length; i++) {
-        const a = samples[i - 1];
-        const b = samples[i];
-        if (b.t <= rampSec) continue;
-        const dt = b.t - a.t;
-        if (dt <= 0) continue;
-        perSec.push(((b.cum - a.cum) * 8) / dt / 1e6);
+      const lastSample = samples[samples.length - 1];
+      const rampSample = samples.find((s) => s.t >= rampSec) || samples[0];
+      let mbps;
+      if (lastSample && rampSample && lastSample.t > rampSample.t && lastSample.cum > rampSample.cum) {
+        const deltaBytes = lastSample.cum - rampSample.cum;
+        const deltaTime = lastSample.t - rampSample.t;
+        mbps = (deltaBytes * 8) / deltaTime / 1e6;
+      } else {
+        mbps = (effectiveBytes * 8) / dur / 1e6;
       }
 
-      const mbps = perSec.length
-        ? perSec.reduce((sum, v) => sum + v, 0) / perSec.length
-        : (effectiveBytes * 8 / dur / 1e6);
-      const peak = perSec.length ? Math.max(...perSec) : mbps;
+      // Peak rate calculated over rolling 1-second window
+      let peak = mbps;
+      for (let i = 10; i < samples.length; i++) {
+        const a = samples[i - 10];
+        const b = samples[i];
+        const dt = b.t - a.t;
+        if (dt > 0) {
+          const rate = ((b.cum - a.cum) * 8) / dt / 1e6;
+          if (rate > peak) peak = rate;
+        }
+      }
 
       resolve({
         mbps,
@@ -386,74 +407,100 @@ export async function runMlabUpload(server, { emit, signal }) {
     if (signal?.aborted) return onAbort();
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    try {
-      ws = new WebSocket(server.uploadUrl, NDT7_SUBPROTOCOL);
-      ws.binaryType = 'arraybuffer';
-    } catch (err) {
-      cleanup();
-      return reject(err);
-    }
-
-    // Keep WebSocket outgoing buffer steadily saturated (~256 KB)
-    const pump = () => {
-      if (settled || !ws || ws.readyState !== WebSocket.OPEN) return;
-      while (ws.readyState === WebSocket.OPEN && ws.bufferedAmount < TARGET_BUFFER) {
-        ws.send(chunk);
-        totalSent += CHUNK_SIZE;
+    // Dynamic buffer pump for an individual stream
+    const pumpStream = (st) => {
+      if (settled || !st.ws || st.ws.readyState !== WebSocket.OPEN) return;
+      const onWire = st.totalSent - st.ws.bufferedAmount;
+      if (st.chunkSize < 1048576 && onWire >= 16 * st.chunkSize) {
+        st.chunkSize = Math.min(1048576, st.chunkSize * 2);
+        st.chunk = randomBuffer(st.chunkSize);
       }
-      if (ws.readyState === WebSocket.OPEN) {
-        pumpTimer = setTimeout(pump, 5);
+      const desired = Math.max(6 * st.chunkSize, 1024 * 1024);
+      while (st.ws.readyState === WebSocket.OPEN && st.ws.bufferedAmount < desired) {
+        st.ws.send(st.chunk);
+        st.totalSent += st.chunkSize;
       }
-    };
-
-    ws.onopen = () => {
-      pump();
-
-      // Start real-time 100ms sampler
-      sampler = setInterval(() => {
-        const now = performance.now();
-        const t = (now - start) / 1000;
-        // Continuous bytes sent onto the wire from the browser
-        const onWire = Math.max(0, totalSent - ws.bufferedAmount);
-        samples.push({ t, cum: onWire });
-
-        // 400ms sliding window for steady, non-oscillating needle velocity
-        const ref = samples[Math.max(0, samples.length - 5)] || { t: 0, cum: 0 };
-        const dt = t - ref.t;
-        if (dt <= 0) return;
-        const v = ((onWire - ref.cum) * 8) / dt / 1e6;
-        ema = ema === 0 ? v : ema + 0.2 * (v - ema);
-        emit?.('sample', 'up', t, v);
-        emit?.('live', 'up', ema);
-      }, SAMPLE_MS);
-
-      durationTimer = setTimeout(() => {
-        finish();
-      }, TEST_DURATION_MS);
-    };
-
-    ws.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        try {
-          const json = JSON.parse(event.data);
-          if (json.TCPInfo?.BytesReceived) {
-            serverReportedBytes = json.TCPInfo.BytesReceived;
-          } else if (json.AppInfo?.NumBytes) {
-            serverReportedBytes = json.AppInfo.NumBytes;
-          }
-        } catch (_) {}
+      if (st.ws.readyState === WebSocket.OPEN && !st.pumpTimer) {
+        st.pumpTimer = setTimeout(() => {
+          st.pumpTimer = null;
+          pumpStream(st);
+        }, 5);
       }
     };
 
-    ws.onerror = (err) => {
-      if (!settled && totalSent === 0) {
+    let openedCount = 0;
+    for (let i = 0; i < numStreams; i++) {
+      const st = streamState[i];
+      try {
+        st.ws = new WebSocket(server.uploadUrl, NDT7_SUBPROTOCOL);
+        st.ws.binaryType = 'arraybuffer';
+      } catch (err) {
         cleanup();
-        reject(new Error('WebSocket upload connection to M-Lab failed.'));
+        return reject(err);
       }
-    };
 
-    ws.onclose = () => {
-      finish();
-    };
+      st.ws.onopen = () => {
+        openedCount++;
+        pumpStream(st);
+        if ('bufferedAmount' in st.ws && 'onbufferedamountlow' in st.ws) {
+          try {
+            st.ws.bufferedAmountLowThreshold = 256 * 1024;
+            st.ws.onbufferedamountlow = () => pumpStream(st);
+          } catch (_) {}
+        }
+        if (openedCount === 1) {
+          sampler = setInterval(() => {
+            const now = performance.now();
+            const t = (now - start) / 1000;
+            let currentWire = 0;
+            for (const s of streamState) {
+              currentWire += Math.max(0, s.totalSent - (s.ws ? s.ws.bufferedAmount : 0));
+              pumpStream(s);
+            }
+            samples.push({ t, cum: currentWire });
+
+            const ref = samples[Math.max(0, samples.length - 5)] || { t: 0, cum: 0 };
+            const dt = t - ref.t;
+            if (dt <= 0) return;
+            const v = ((currentWire - ref.cum) * 8) / dt / 1e6;
+            ema = ema === 0 ? v : ema + 0.18 * (v - ema);
+            emit?.('sample', 'up', t, v);
+            emit?.('live', 'up', ema);
+          }, SAMPLE_MS);
+
+          durationTimer = setTimeout(() => {
+            finish();
+          }, TEST_DURATION_MS);
+        }
+      };
+
+      st.ws.onmessage = (event) => {
+        pumpStream(st);
+        if (typeof event.data === 'string') {
+          try {
+            const json = JSON.parse(event.data);
+            if (json.TCPInfo?.BytesReceived != null) {
+              st.serverBytes = json.TCPInfo.BytesReceived;
+            } else if (json.AppInfo?.NumBytes != null) {
+              st.serverBytes = json.AppInfo.NumBytes;
+            }
+          } catch (_) {}
+        }
+      };
+
+      st.ws.onerror = () => {
+        if (settled) return;
+        const anyRunning = streamState.some(s => s.ws && s.ws.readyState === WebSocket.OPEN);
+        if (!anyRunning && streamState.every(s => s.totalSent === 0)) {
+          cleanup();
+          reject(new Error('WebSocket upload connection to M-Lab failed.'));
+        }
+      };
+
+      st.ws.onclose = () => {
+        const allClosed = streamState.every(s => !s.ws || s.ws.readyState === WebSocket.CLOSED);
+        if (allClosed) finish();
+      };
+    }
   });
 }

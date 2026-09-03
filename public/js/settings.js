@@ -10,7 +10,7 @@ export const DEFAULTS = {
   date: 'MDY', // 'MDY' | 'DMY' | 'YMD'
   distance: 'mi', // 'mi' | 'km'
   speed: 'mbps', // 'mbps' | 'kbps'
-  server: 'mlab', // one of engine.js SERVERS ids
+  server: 'auto', // 'auto' | one of engine.js SERVERS ids
 };
 
 // Allowed values for the enum settings ('server' is validated by the caller

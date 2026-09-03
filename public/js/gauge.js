@@ -29,15 +29,28 @@ function speedToFrac(v) {
   return (i + (v - lo) / (hi - lo)) / (STOPS.length - 1);
 }
 
+function fracToSpeed(f) {
+  if (!Number.isFinite(f) || f <= 0) return 0;
+  if (f >= 1) return STOPS[STOPS.length - 1];
+  const n = STOPS.length - 1;
+  const scaled = f * n;
+  const i = Math.floor(scaled);
+  const rem = scaled - i;
+  if (i >= n) return STOPS[n];
+  return STOPS[i] + rem * (STOPS[i + 1] - STOPS[i]);
+}
+
 export class Gauge {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.tokens = readTokens(canvas);
     this.kind = 'idle';        // idle | ping | down | up | done
-    this.target = 0;           // Mbps
-    this.current = 0;          // eased Mbps
-    this.needleFrac = 0;       // needle position — tracks current, parks to 0
+    this.target = 0;           // target real Mbps
+    this.current = 0;          // smoothly eased Mbps (exact match to needle angle)
+    this.needleFrac = 0;       // needle position [0, 1] — parks smoothly to 0
+    this.velocity = 0;         // rotational velocity (fractions/sec) for physical inertia
+    this.onValue = null;       // live synchronized readout callback
     this.parkRaf = null;
     this.parkTimer = null;
     this.trail = [];           // [{frac, at}]
@@ -76,6 +89,7 @@ export class Gauge {
       this.target = 0;
       this.current = 0;
       this.needleFrac = 0;
+      this.velocity = 0;
       this.trail = [];
       this.cancelPark();
     }
@@ -86,19 +100,61 @@ export class Gauge {
     this.target = Math.max(0, mbps || 0);
   }
 
-  start() {
+  start(onValue) {
     if (this.raf) return;
     this.cancelPark();
+    if (onValue) this.onValue = onValue;
+    let lastT = performance.now();
+
     const tick = () => {
-      this.current = reducedMotion()
-        ? this.target
-        : this.current + (this.target - this.current) * 0.14;
-      this.needleFrac = speedToFrac(this.current);
+      const now = performance.now();
+      const dt = Math.min((now - lastT) / 1000, 0.05);
+      lastT = now;
+
+      if (reducedMotion()) {
+        this.current = this.target;
+        this.needleFrac = speedToFrac(this.current);
+        this.velocity = 0;
+      } else {
+        const targetFrac = speedToFrac(this.target);
+
+        // Physical spring-damper inertia model for slow-motion, realistic needle sweep:
+        // omega = 3.6 rad/s gives an elegant, measured cadence.
+        // Critical damping (zeta = 1.0) ensures no oscillation or violent twitching.
+        const omega = 3.6;
+        const springForce = (targetFrac - this.needleFrac) * (omega * omega);
+        const dampingForce = -2 * omega * this.velocity;
+        const accel = springForce + dampingForce;
+
+        this.velocity += accel * dt;
+
+        // Cap maximum sweep velocity to prevent rapid jumping on network bursts
+        const maxVel = 0.52;
+        this.velocity = Math.max(-maxVel, Math.min(maxVel, this.velocity));
+
+        this.needleFrac += this.velocity * dt;
+        this.needleFrac = Math.max(0, Math.min(1, this.needleFrac));
+
+        // When nearly settled, settle exactly to prevent micro-jitter
+        if (Math.abs(targetFrac - this.needleFrac) < 0.0003 && Math.abs(this.velocity) < 0.001) {
+          this.needleFrac = targetFrac;
+          this.velocity = 0;
+        }
+
+        // Exact match between needle dial position and readout speed
+        this.current = fracToSpeed(this.needleFrac);
+      }
+
+      if (this.onValue) {
+        this.onValue(this.current);
+      }
+
       if (!reducedMotion() && (this.kind === 'down' || this.kind === 'up')) {
-        this.trail.push({ frac: this.needleFrac, at: performance.now() });
-        const cutoff = performance.now() - TRAIL_LIFE_MS;
+        this.trail.push({ frac: this.needleFrac, at: now });
+        const cutoff = now - TRAIL_LIFE_MS;
         while (this.trail.length && this.trail[0].at < cutoff) this.trail.shift();
       }
+
       this.draw();
       this.raf = requestAnimationFrame(tick);
     };
@@ -109,15 +165,12 @@ export class Gauge {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = null;
     this.trail = [];
-    this.current = this.target;
-    this.needleFrac = speedToFrac(this.current);
+    this.velocity = 0;
     this.draw();
   }
 
-  // Wind the whole instrument back to rest — needle home, arc draining, and
-  // the live value easing to 0 (reported via onValue so the DOM readout can
-  // count down in sync). A real meter reads zero when the run is over; the
-  // result lives in the tiles/history, not the dial.
+  // Wind the whole instrument back to rest in slow motion — needle home,
+  // arc draining, and the live numeral easing smoothly to 0.
   park(onValue) {
     if (this.parkRaf) cancelAnimationFrame(this.parkRaf);
     if (this.parkTimer) clearTimeout(this.parkTimer);
@@ -128,6 +181,7 @@ export class Gauge {
       this.needleFrac = 0;
       this.current = 0;
       this.target = 0;
+      this.velocity = 0;
       if (onValue) onValue(0);
       this.draw();
     };
@@ -136,22 +190,23 @@ export class Gauge {
       return;
     }
     const fromFrac = this.needleFrac;
-    const fromVal = this.current;
     const t0 = performance.now();
-    const dur = 850;
+    const dur = 1350; // Elegant slow-motion wind down
     const step = () => {
-      const k = Math.min(1, (performance.now() - t0) / dur);
-      const ease = 1 - (1 - k) ** 3; // ease-out cubic
+      const now = performance.now();
+      const k = Math.min(1, (now - t0) / dur);
+      // Quartic ease-out for a gradual aerodynamic slowdown
+      const ease = 1 - (1 - k) ** 4;
       this.needleFrac = fromFrac * (1 - ease);
-      this.current = fromVal * (1 - ease);
+      this.current = fracToSpeed(this.needleFrac);
       this.target = this.current;
+      this.velocity = 0;
       if (onValue) onValue(this.current);
       this.draw();
       this.parkRaf = k < 1 ? requestAnimationFrame(step) : null;
       if (k >= 1 && this.parkTimer) { clearTimeout(this.parkTimer); this.parkTimer = null; }
     };
     this.parkRaf = requestAnimationFrame(step);
-    // rAF pauses in hidden tabs — guarantee the dial lands on 0 regardless.
     this.parkTimer = setTimeout(finish, dur + 250);
   }
 

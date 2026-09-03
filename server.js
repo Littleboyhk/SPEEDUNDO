@@ -19,15 +19,16 @@
  * Storage: data/results.json — flat array, capped, seeded with demo data on
  * first boot so every feature renders before real submissions accumulate.
  */
-'use strict';
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-
-const ROOT = __dirname;
+const __filename = fileURLToPath(import.meta.url);
+const ROOT = path.dirname(__filename);
+const PUBLIC_DIR = path.join(ROOT, 'public');
 const PORT = Number(process.env.PORT) || 8787;
-const MAX_DOWN = 1e9; // 1 GB cap per request
+const MAX_DOWN = 50_000_000; // 50 MB cap per request (was 1 GB)
 const DATA_DIR = path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'results.json');
 const MAX_RECORDS = 20000;
@@ -50,12 +51,37 @@ const MIME = {
 
 const ZEROS = Buffer.alloc(64 * 1024);
 
-function corsHeaders() {
+function securityHeaders(extra = {}) {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'SAMEORIGIN',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    ...extra,
+  };
+}
+
+function escapeXml(s) {
+  return String(s || '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+function corsHeaders(req) {
+  const origin = req?.headers?.origin;
+  const host = req?.headers?.host;
+  const isSameOrLocal = Boolean(origin && host && (
+    origin.includes(host) || origin.includes('localhost') || origin.includes('127.0.0.1')
+  ));
+  const exposed = isSameOrLocal
+    ? 'cf-meta-ip, cf-meta-colo, content-length'
+    : 'cf-meta-colo, content-length';
+
   return {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Expose-Headers': 'cf-meta-ip, cf-meta-colo, content-length',
+    'Access-Control-Expose-Headers': exposed,
+    ...securityHeaders(),
   };
 }
 
@@ -65,7 +91,7 @@ function handleDown(req, res, u) {
   const parsed = parseInt(u.searchParams.get('bytes') || '0', 10);
   const n = Math.max(0, Math.min(MAX_DOWN, Number.isFinite(parsed) ? parsed : 0));
   res.writeHead(200, {
-    ...corsHeaders(),
+    ...corsHeaders(req),
     'Content-Type': 'application/octet-stream',
     'Content-Length': String(n),
     'Cache-Control': 'no-store, no-transform',
@@ -113,7 +139,7 @@ function handleUp(req, res) {
     // too short to be meaningful (e.g. a single-chunk loopback POST).
     const mbps = ms > 0 ? Math.round(((received * 8) / (ms * 1000)) * 100) / 100 : null;
     res.writeHead(200, {
-      ...corsHeaders(),
+      ...corsHeaders(req),
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
     });
@@ -416,9 +442,9 @@ function patterns({ isp, city }) {
 
 /* ---- API handlers ----------------------------------------------------------- */
 
-function sendJson(res, code, obj) {
+function sendJson(res, code, obj, req) {
   res.writeHead(code, {
-    ...corsHeaders(),
+    ...corsHeaders(req),
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
   });
@@ -431,7 +457,33 @@ const cleanNum = (v, lo, hi) => {
   return Number.isFinite(n) && n >= lo && n <= hi ? n : null;
 };
 
+// Rate limiter for /api/submit: max 5 submissions per 5 minutes per IP
+const submitRateLimits = new Map();
+const SUBMIT_WINDOW_MS = 5 * 60 * 1000;
+const SUBMIT_MAX_PER_WINDOW = 5;
+
+function isSubmitRateLimited(ip) {
+  const now = Date.now();
+  const times = submitRateLimits.get(ip) || [];
+  const recent = times.filter((t) => now - t < SUBMIT_WINDOW_MS);
+  if (recent.length >= SUBMIT_MAX_PER_WINDOW) {
+    return true;
+  }
+  recent.push(now);
+  submitRateLimits.set(ip, recent);
+  if (submitRateLimits.size > 2000) {
+    for (const [k, v] of submitRateLimits.entries()) {
+      if (!v.some((t) => now - t < SUBMIT_WINDOW_MS)) submitRateLimits.delete(k);
+    }
+  }
+  return false;
+}
+
 function handleSubmit(req, res) {
+  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '') || '127.0.0.1';
+  if (isSubmitRateLimited(ip)) {
+    return sendJson(res, 429, { ok: false, error: 'Too many submissions. Please wait.' }, req);
+  }
   let body = '';
   let overflow = false;
   req.on('data', (c) => {
@@ -442,7 +494,7 @@ function handleSubmit(req, res) {
     if (overflow) return;
     let j;
     try { j = JSON.parse(body); } catch (_) {
-      return sendJson(res, 400, { ok: false, error: 'Body must be JSON.' });
+      return sendJson(res, 400, { ok: false, error: 'Body must be JSON.' }, req);
     }
     const rec = {
       ts: Date.now(),
@@ -458,13 +510,16 @@ function handleSubmit(req, res) {
       jitter: cleanNum(j.jitter, 0, 10000),
       loss: cleanNum(j.loss, 0, 100),
     };
+    if (j.ts && typeof j.ts === 'number' && Math.abs(Date.now() - j.ts) < 3600000) {
+      rec.ts = j.ts;
+    }
     if (!rec.isp || !rec.city || rec.down == null) {
-      return sendJson(res, 400, { ok: false, error: 'isp, city and down are required.' });
+      return sendJson(res, 400, { ok: false, error: 'isp, city and down are required.' }, req);
     }
     records.push(rec);
     if (records.length > MAX_RECORDS) records = records.slice(-MAX_RECORDS);
     persist();
-    sendJson(res, 200, { ok: true, stored: true });
+    sendJson(res, 200, { ok: true, stored: true }, req);
   });
   req.on('error', () => {});
 }
@@ -476,13 +531,15 @@ function badgeSvg(u) {
   const rs = filterRecords({ city, isp, sinceMs: 30 * DAY });
   const value = median(rs.map((r) => r[metric]));
   const h = healthFor(rs);
-  const label = (isp || city || 'internet').slice(0, 24);
+  const rawLabel = (isp || city || 'internet').slice(0, 24);
   const arrow = metric === 'down' ? '↓' : '↑';
-  const text = value == null ? 'no data' : `${round1(value)} Mbps ${arrow}`;
+  const rawText = value == null ? 'no data' : `${round1(value)} Mbps ${arrow}`;
   const color = { good: '#0CA30C', warning: '#B08000', serious: '#C25E2E', critical: '#D03B3B', unknown: '#666F7D' }[h.status];
-  const lw = 60 + label.length * 7.2; // extra base width for the "speedundo · " prefix
-  const vw = 24 + text.length * 7.2;
+  const lw = 60 + rawLabel.length * 7.2; // extra base width for the "speedundo · " prefix
+  const vw = 24 + rawText.length * 7.2;
   const w = Math.round(lw + vw);
+  const label = escapeXml(rawLabel);
+  const text = escapeXml(rawText);
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="24" role="img" aria-label="${label}: ${text}">
   <linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-opacity=".08"/><stop offset="1" stop-opacity=".18" stop-color="#000"/></linearGradient>
   <rect rx="4" width="${w}" height="24" fill="#0D1420"/>
@@ -499,21 +556,21 @@ function handleApi(req, res, u) {
   const q = u.searchParams;
   switch (u.pathname) {
     case '/api/submit':
-      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only.' });
+      if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'POST only.' }, req);
       return handleSubmit(req, res);
     case '/api/leaderboard':
       return sendJson(res, 200, leaderboard({
         city: q.get('city'), postal: q.get('postal'),
         windowDays: Math.min(90, Math.max(1, Number(q.get('window')) || 30)),
-      }));
+      }), req);
     case '/api/patterns':
-      return sendJson(res, 200, patterns({ isp: q.get('isp'), city: q.get('city') }));
+      return sendJson(res, 200, patterns({ isp: q.get('isp'), city: q.get('city') }), req);
     case '/api/outage': {
       const rs = filterRecords({ isp: q.get('isp'), city: q.get('city'), sinceMs: 30 * DAY });
       return sendJson(res, 200, {
         scope: { isp: q.get('isp') || null, city: q.get('city') || null },
         ...healthFor(rs),
-      });
+      }, req);
     }
     case '/api/stats': {
       const scope = { isp: q.get('isp'), city: q.get('city'), postal: q.get('postal') };
@@ -529,18 +586,20 @@ function handleApi(req, res, u) {
           loss: round1(median(rs.map((r) => r.loss).filter((v) => v != null))),
         },
         health: healthFor(rs),
-      });
+      }, req);
     }
     case '/api/badge.svg': {
       res.writeHead(200, {
-        ...corsHeaders(),
+        ...corsHeaders(req),
         'Content-Type': 'image/svg+xml; charset=utf-8',
         'Cache-Control': 'public, max-age=300',
+        'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+        'X-Content-Type-Options': 'nosniff',
       });
       return res.end(badgeSvg(u));
     }
     default:
-      return sendJson(res, 404, { ok: false, error: 'Unknown API path.' });
+      return sendJson(res, 404, { ok: false, error: 'Unknown API path.' }, req);
   }
 }
 
@@ -551,32 +610,39 @@ function handleStatic(res, pathname) {
   try {
     rel = decodeURIComponent(pathname);
   } catch (_) {
-    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.writeHead(400, { 'Content-Type': 'text/plain', ...securityHeaders() });
     res.end('Bad request');
     return;
   }
-  if (rel === '/') rel = '/index.html';
-  const abs = path.normalize(path.join(ROOT, rel));
-  if (abs !== ROOT && !abs.startsWith(ROOT + path.sep)) {
-    res.writeHead(403, { 'Content-Type': 'text/plain' });
+  if (rel === '/' || rel === '') rel = '/index.html';
+  const abs = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (!abs.startsWith(PUBLIC_DIR + path.sep) && abs !== PUBLIC_DIR) {
+    res.writeHead(403, { 'Content-Type': 'text/plain', ...securityHeaders() });
     res.end('Forbidden');
     return;
   }
-  if (abs.startsWith(DATA_DIR)) { // the community store is not a public file
-    res.writeHead(403, { 'Content-Type': 'text/plain' });
+  const parts = rel.split(/[\\/]/).filter(Boolean);
+  if (parts.some((p) => p.startsWith('.'))) {
+    res.writeHead(403, { 'Content-Type': 'text/plain', ...securityHeaders() });
     res.end('Forbidden');
     return;
   }
   fs.readFile(abs, (err, data) => {
     if (err) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.writeHead(404, { 'Content-Type': 'text/plain', ...securityHeaders() });
       res.end('Not found');
       return;
     }
-    res.writeHead(200, {
-      'Content-Type': MIME[path.extname(abs).toLowerCase()] || 'application/octet-stream',
+    const ext = path.extname(abs).toLowerCase();
+    const headers = {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
       'Cache-Control': 'no-cache',
-    });
+      ...securityHeaders(),
+    };
+    if (ext === '.html') {
+      headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https: wss:;";
+    }
+    res.writeHead(200, headers);
     res.end(data);
   });
 }

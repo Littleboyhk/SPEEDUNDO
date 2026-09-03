@@ -126,13 +126,19 @@ function renderMetaChips(meta, loadedRtt) {
 
 function fillDetails(r) {
   const u = speedUnitLabel();
+  const srvObj = SERVERS.find((s) => s.id === (r.selectedServerId || r.server)) || SERVERS[0];
+  const serverDisplay = r.autoServer
+    ? `⚡ Auto → ${srvObj.label}${r.autoRtt ? ` (${fmtMs(r.autoRtt)} ms latency)` : ''}`
+    : srvObj.label;
+  const isWebSocket = (r.selectedServerId || r.server) === 'mlab';
   const rows = [
+    ['Server', serverDisplay],
     ['Download avg', `${fmtMbps(r.down)} ${u}`],
     ['Download peak', `${fmtMbps(r.downPeak)} ${u}`],
-    ['Data received', `${fmtBytes(r.downBytes)} in ${r.downDur.toFixed(1)} s${r.server === 'mlab' ? ' · NDT7 WebSocket' : ' · 5 streams'}`],
+    ['Data received', `${fmtBytes(r.downBytes)} in ${r.downDur.toFixed(1)} s${isWebSocket ? ' · NDT7 WebSocket' : ' · 5 streams'}`],
     ['Upload avg', `${fmtMbps(r.up)} ${u}`],
     ['Upload peak', `${fmtMbps(r.upPeak)} ${u}`],
-    ['Data sent', `${fmtBytes(r.upBytes)} in ${r.upDur.toFixed(1)} s${r.server === 'mlab' ? ' · NDT7 WebSocket' : ' · 4 streams'}`],
+    ['Data sent', `${fmtBytes(r.upBytes)} in ${r.upDur.toFixed(1)} s${isWebSocket ? ' · NDT7 WebSocket' : ' · 4 streams'}`],
     ['Ping (median)', `${fmtMs(r.ping)} ms`],
     ['Jitter', `${fmtMs(r.jitter)} ms`],
     ['Loaded RTT', r.loadedRtt != null ? `${fmtMs(r.loadedRtt)} ms` : '—'],
@@ -142,7 +148,7 @@ function fillDetails(r) {
         : (r.lossMethod === 'probe'
           ? `${fmtPct(r.loss)} % (Network probe, ${r.lossReceived}/${r.lossSent} received)`
           : `${fmtPct(r.loss)} % (UDP, ${r.lossReceived}/${r.lossSent} via TURN relay)`))
-      : (r.server === 'local' ? 'not measured for LAN tests' : 'unavailable')],
+      : ((r.selectedServerId || r.server) === 'local' ? 'not measured for LAN tests' : 'unavailable')],
     ['ISP', r.geo?.isp || '—'],
     ['Location', [r.geo?.city, r.geo?.region, r.geo?.postal].filter(Boolean).join(' · ') || '—'],
   ];
@@ -180,10 +186,16 @@ function start() {
   setPhaseChip(PHASE_LABEL.meta, 'idle');
   setReading('···', '');
   gauge.setKind('idle');
-  gauge.start();
+  gauge.start((val) => {
+    setReading(fmtMbps(val), speedUnitLabel());
+  });
   announce('Test started. Connecting to the test server.');
 
   engine = new SpeedTest(server, {
+    server_selected(srv, rtt) {
+      const rttText = rtt != null ? ` (${fmtMs(rtt)} ms)` : '';
+      setPhaseChip(`ROUTED: ${srv.label.split('(')[0].trim()}${rttText}`, 'idle');
+    },
     phase(name) {
       const kind = PHASE_KIND[name] || 'idle';
       if (name !== 'done') setPhaseChip(PHASE_LABEL[name], kind);
@@ -196,13 +208,11 @@ function start() {
       } else if (name === 'download') {
         gauge.setKind('down');
         gauge.setValue(0);
-        setReading('0', speedUnitLabel());
         announce('Measuring download speed.');
       } else if (name === 'upload') {
         upOffset = lastDownT + 1;
         gauge.setKind('up');
         gauge.setValue(0);
-        setReading('0', speedUnitLabel());
         announce('Measuring upload speed.');
       } else if (name === 'loss') {
         // Packet loss also runs behind the meter — result goes to its tile.
@@ -235,7 +245,6 @@ function start() {
     },
     live(kind, mbps) {
       gauge.setValue(mbps);
-      setReading(fmtMbps(mbps), speedUnitLabel());
       (kind === 'down' ? els.downVal : els.upVal).textContent = fmtMbps(mbps);
     },
     done(result) {
@@ -246,10 +255,9 @@ function start() {
       els.downVal.textContent = fmtMbps(result.down);
       els.upVal.textContent = fmtMbps(result.up);
       gauge.setKind('done');
-      gauge.setValue(result.down);
       gauge.stop();
       trace.finish();
-      // Whole dial winds down to rest — needle, arc, and the center numeral.
+      // Whole dial winds down to rest in graceful slow-motion — needle, arc, and the center numeral.
       // The result stays in the tiles, details, and history.
       gauge.park((v) => setReading(v === 0 ? '0' : fmtMbps(v), speedUnitLabel()));
       setPhaseChip(PHASE_LABEL.done, 'down');
@@ -259,7 +267,8 @@ function start() {
       setState('done');
       // Community layer: share (only real-internet tests carry real ISP truth)
       // then refresh the leaderboard/outage/patterns for this connection.
-      if ((result.server === 'cloudflare' || result.server === 'mlab') && result.geo) {
+      const srv = SERVERS.find((s) => s.id === (result.selectedServerId || result.server));
+      if (srv?.internet && result.geo) {
         submitResult(result).finally(() => loadIntel(result.geo));
       } else if (result.geo || currentGeo) {
         loadIntel(result.geo || currentGeo);

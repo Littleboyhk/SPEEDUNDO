@@ -18,29 +18,108 @@ import { discoverMlabServer, measureMlabPing, runMlabDownload, runMlabUpload } f
 
 export const SERVERS = [
   {
-    id: 'mlab',
-    label: 'M-Lab (Google / NDT7)',
+    id: 'auto',
+    label: '⚡ Auto (Optimal & Lowest Latency)',
     hasMeta: true,
     internet: true,
-    protocol: 'ndt7',
   },
   {
     id: 'cloudflare',
-    label: 'Cloudflare edge',
+    label: 'Cloudflare Global Edge (330+ Cities · Anycast)',
+    ping: () => 'https://speed.cloudflare.com/__down?bytes=0',
     down: (bytes) => `https://speed.cloudflare.com/__down?bytes=${bytes}`,
     up: 'https://speed.cloudflare.com/__up',
     hasMeta: true,
     internet: true,
   },
   {
+    id: 'mlab',
+    label: 'Google / M-Lab NDT7 (Global Transit & ISPs)',
+    hasMeta: true,
+    internet: true,
+    protocol: 'ndt7',
+  },
+  {
+    id: 'tokyo',
+    label: 'Tokyo, Japan (A573 · Asia-Pacific 10G)',
+    ping: 'https://librespeed.a573.net/backend/empty.php?cors=true',
+    down: (bytes) => `https://librespeed.a573.net/backend/garbage.php?cors=true&ckSize=${Math.max(1, Math.min(50, Math.round(bytes / 1048576)))}`,
+    up: 'https://librespeed.a573.net/backend/empty.php?cors=true',
+    hasMeta: false,
+    internet: true,
+  },
+  {
+    id: 'london',
+    label: 'London, UK (Clouvider 10G · Europe)',
+    ping: 'https://lon.speedtest.clouvider.net/backend/empty.php?cors=true',
+    down: (bytes) => `https://lon.speedtest.clouvider.net/backend/garbage.php?cors=true&ckSize=${Math.max(1, Math.min(50, Math.round(bytes / 1048576)))}`,
+    up: 'https://lon.speedtest.clouvider.net/backend/empty.php?cors=true',
+    hasMeta: false,
+    internet: true,
+  },
+  {
+    id: 'us-west',
+    label: 'Los Angeles, USA (Sharktech 10G · North America West)',
+    ping: 'https://laxspeed.sharktech.net/backend/empty.php?cors=true',
+    down: (bytes) => `https://laxspeed.sharktech.net/backend/garbage.php?cors=true&ckSize=${Math.max(1, Math.min(50, Math.round(bytes / 1048576)))}`,
+    up: 'https://laxspeed.sharktech.net/backend/empty.php?cors=true',
+    hasMeta: false,
+    internet: true,
+  },
+  {
+    id: 'us-midwest',
+    label: 'Chicago, USA (Sharktech 10G · North America Central)',
+    ping: 'https://chispeed.sharktech.net/backend/empty.php?cors=true',
+    down: (bytes) => `https://chispeed.sharktech.net/backend/garbage.php?cors=true&ckSize=${Math.max(1, Math.min(50, Math.round(bytes / 1048576)))}`,
+    up: 'https://chispeed.sharktech.net/backend/empty.php?cors=true',
+    hasMeta: false,
+    internet: true,
+  },
+  {
     id: 'local',
-    label: 'This server',
+    label: 'This server (Local LAN / Router Benchmark)',
+    ping: () => '/down?bytes=0',
     down: (bytes) => `/down?bytes=${bytes}`,
     up: '/up',
     hasMeta: false,
     internet: false,
   },
 ];
+
+export async function autoSelectBestServer(opts = {}) {
+  const signal = opts.signal;
+  // Probe top global edge candidates in parallel with 2.5s timeout
+  const candidates = [
+    SERVERS.find((s) => s.id === 'cloudflare'),
+    SERVERS.find((s) => s.id === 'mlab'),
+    SERVERS.find((s) => s.id === 'tokyo'),
+    SERVERS.find((s) => s.id === 'london'),
+    SERVERS.find((s) => s.id === 'us-west'),
+  ].filter(Boolean);
+
+  const probes = candidates.map(async (srv) => {
+    const t0 = performance.now();
+    try {
+      if (srv.id === 'mlab') {
+        const mServer = await discoverMlabServer({ signal, timeoutMs: 2200 });
+        const pingMs = await measureMlabPing(mServer, { signal });
+        const rtt = pingMs?.ping || (performance.now() - t0);
+        return { srv, rtt };
+      }
+      const pingUrl = typeof srv.ping === 'function' ? srv.ping() : (srv.ping || srv.down(0));
+      const child = signal ? AbortSignal.any([signal, AbortSignal.timeout(2200)]) : AbortSignal.timeout(2200);
+      const res = await fetch(pingUrl, { cache: 'no-store', signal: child });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return { srv, rtt: performance.now() - t0 };
+    } catch (_) {
+      return { srv, rtt: Infinity };
+    }
+  });
+
+  const results = await Promise.all(probes);
+  const valid = results.filter((r) => Number.isFinite(r.rtt) && r.rtt < Infinity).sort((a, b) => a.rtt - b.rtt);
+  return valid.length ? valid[0] : { srv: candidates[0], rtt: null };
+}
 
 const PING_COUNT = 10;
 const PING_MAX_ATTEMPTS = 14;   // lossy networks may drop a few probes
@@ -140,6 +219,9 @@ export class SpeedTest {
     const result = {
       ts: Date.now(),
       server: this.server.id,
+      selectedServerId: this.server.id,
+      autoServer: false,
+      autoRtt: null,
       ping: null, jitter: null,
       down: null, downPeak: null, downBytes: 0, downDur: 0,
       up: null, upPeak: null, upBytes: 0, upDur: 0,
@@ -149,6 +231,18 @@ export class SpeedTest {
       geo: null, // {isp, asn, city, region, country, postal} from geo.js
     };
     try {
+      if (this.server.id === 'auto') {
+        this.emit('phase', 'meta');
+        const autoResult = await autoSelectBestServer({ signal: this.signal });
+        if (autoResult?.srv) {
+          this.server = autoResult.srv;
+          result.selectedServerId = autoResult.srv.id;
+          result.autoServer = true;
+          result.autoRtt = autoResult.rtt;
+          this.emit('server_selected', autoResult.srv, autoResult.rtt);
+        }
+      }
+
       // ISP/city lookup runs alongside the whole test; awaited before 'done'.
       const geoPromise = detectIsp({ signal: this.signal })
         .then((g) => { if (g) this.emit('isp', g); return g; })
@@ -260,6 +354,7 @@ export class SpeedTest {
       const up = await runMlabUpload(mlabServer, {
         emit: this.emit.bind(this),
         signal: this.signal,
+        streams: UP_STREAMS,
       });
       Object.assign(result, {
         up: up.mbps,
@@ -336,7 +431,10 @@ export class SpeedTest {
     const child = timeoutMs ? this.childSignal(timeoutMs) : null;
     const t0 = performance.now();
     try {
-      const res = await fetch(this.server.down(0), {
+      const pingUrl = typeof this.server.ping === 'function'
+        ? this.server.ping()
+        : (this.server.ping || this.server.down(0));
+      const res = await fetch(pingUrl, {
         cache: 'no-store', signal: child ? child.signal : this.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -405,7 +503,7 @@ export class SpeedTest {
       const dt = t - ref.t;
       if (dt <= 0) return;
       const v = ((bytes - ref.cum) * 8) / dt / 1e6;
-      ema = ema === 0 ? v : ema + 0.2 * (v - ema);
+      ema = ema === 0 ? v : ema + 0.18 * (v - ema);
       this.emit('sample', kind, t, v);
       this.emit('live', kind, ema);
     }, SAMPLE_MS);
@@ -444,36 +542,29 @@ export class SpeedTest {
     // no change in behaviour there.
     const dur = ((bytes > 0 ? lastByteAt : end) - start) / 1000;
 
-    // Steady-state headline: collapse the 100 ms samples into 1 s per-second
-    // rates, drop the TCP ramp (first ~1.5 s), and average the rest. Per-second
-    // bins weight every steady second equally, so the figure converges on the
-    // sustained rate instead of creeping as a long byte/time average would.
+    // Steady-state headline: compute sustained rate across the post-ramp window.
+    // Measuring cumulative bytes moved over the steady duration eliminates TCP window
+    // oscillation and steppy chunk-completion artifacts.
     const rampSec = Math.min(RAMP_SEC, dur * 0.3);
-    const perSec = [];
-    for (let i = 1; i < samples.length; i++) {
-      const a = samples[i - 1];
-      const b = samples[i];
-      if (b.t <= rampSec) continue;             // still in the ramp
-      const dt = b.t - a.t;
-      if (dt <= 0) continue;
-      perSec.push(((b.cum - a.cum) * 8) / dt / 1e6);
+    const rampSample = samples.find((s) => s.t >= rampSec) || samples[0];
+    const lastSample = samples[samples.length - 1];
+    let mbps;
+    if (lastSample && rampSample && lastSample.t > rampSample.t && lastSample.cum > rampSample.cum) {
+      mbps = ((lastSample.cum - rampSample.cum) * 8) / (lastSample.t - rampSample.t) / 1e6;
+    } else {
+      mbps = (bytes * 8) / dur / 1e6;
     }
-    // Coalesce the 100 ms bins into ~1 s bins for a stable figure.
-    const bins = [];
-    for (let i = 0; i < perSec.length; i += Math.round(STEADY_SAMPLE_MS / SAMPLE_MS)) {
-      const slice = perSec.slice(i, i + Math.round(STEADY_SAMPLE_MS / SAMPLE_MS));
-      if (slice.length) bins.push(slice.reduce((x, y) => x + y, 0) / slice.length);
-    }
-    const steady = bins.length ? bins : perSec;
-    const mbps = steady.length
-      ? steady.reduce((x, y) => x + y, 0) / steady.length
-      : ((bytes * 8) / dur / 1e6); // degenerate (very short window) fallback
 
-    // Peak over a 3-sample moving average (raw 100 ms samples are spiky).
-    let peak = 0;
-    for (let i = 2; i < samples.length; i++) {
-      const avg = (samples[i].v + samples[i - 1].v + samples[i - 2].v) / 3;
-      if (avg > peak) peak = avg;
+    // Peak rate calculated over rolling 500 ms window
+    let peak = mbps;
+    for (let i = 5; i < samples.length; i++) {
+      const a = samples[i - 5];
+      const b = samples[i];
+      const dt = b.t - a.t;
+      if (dt > 0) {
+        const rate = ((b.cum - a.cum) * 8) / dt / 1e6;
+        if (rate > peak) peak = rate;
+      }
     }
 
     // TCP packet-loss fallback was removed: it ran an 8 s post-phase download
