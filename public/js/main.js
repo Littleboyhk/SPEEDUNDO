@@ -7,6 +7,7 @@ import { Trace } from './trace.js';
 import { initTheme, toggleTheme, currentTheme } from './theme.js';
 import {
   loadHistory, saveResult, clearHistory, deleteEntry, renderHistory,
+  updateEntryTag, exportHistoryCsv, computeComparison, AVAILABLE_TAGS,
 } from './history.js';
 import {
   fmtMbps, fmtMs, fmtBytes, fmtPct, fmtDateTime, speedUnitLabel,
@@ -21,11 +22,25 @@ import {
   defaultCaption, drawCard, copyCardToClipboard, downloadCard,
   nativeShare, renderNetworkButtons,
 } from './share.js';
+import {
+  unlockAudio, playRelayClick, playProbeTick,
+  startThroughputSweep, updateThroughputSweep, stopThroughputSweep,
+  playCompletionChime,
+} from './audio.js';
+import { renderQualityCard } from './quality.js';
+import {
+  openDisputeModal, closeDisputeModal, copyDisputeReport, downloadDisputeReport,
+} from './report.js';
+import { PingMonitor } from './monitor.js';
+import {
+  runGlobalPingMatrix, runDnsBenchmark, checkIpv6Support, renderMatrixView,
+} from './matrix.js';
 
 const $ = (id) => document.getElementById(id);
 
 const els = {
   themeBtn: $('themeBtn'), historyBtn: $('historyBtn'),
+  soundBtn: $('soundBtn'), kioskBtn: $('kioskBtn'), monitorBtn: $('monitorBtn'),
   gaugeCanvas: $('gauge'), goBtn: $('goBtn'),
   reading: $('gaugeReading'), liveValue: $('liveValue'), liveUnit: $('liveUnit'),
   phaseChip: $('phaseChip'), phaseLed: $('phaseLed'), phaseText: $('phaseText'),
@@ -39,9 +54,26 @@ const els = {
   downVal: $('downVal'), upVal: $('upVal'),
   ispLine: $('ispLine'), ispName: $('ispName'), ispWhere: $('ispWhere'),
   outage: $('outage'),
+  resultTagBar: $('resultTagBar'), resultTagChips: $('resultTagChips'),
+  qualitySection: $('qualitySection'),
+  disputeBtn: $('disputeBtn'), disputeModal: $('disputeModal'),
+  disputeBackdrop: $('disputeBackdrop'), disputeClose: $('disputeClose'),
+  disputePreview: $('disputePreview'), disputePrint: $('disputePrint'),
+  disputeCopy: $('disputeCopy'), disputeDownload: $('disputeDownload'),
+  monitorModal: $('monitorModal'), monitorBackdrop: $('monitorBackdrop'),
+  monitorClose: $('monitorClose'), monitorCanvas: $('monitorCanvas'),
+  monitorList: $('monitorList'), monitorStats: $('monitorStats'),
+  monitorToggleBtn: $('monitorToggleBtn'), monitorClearBtn: $('monitorClearBtn'),
+  monitorExportBtn: $('monitorExportBtn'),
+  compareModal: $('compareModal'), compareBackdrop: $('compareBackdrop'),
+  compareClose: $('compareClose'), compareContent: $('compareContent'),
+  compareBtn: $('compareBtn'), exportCsvBtn: $('exportCsvBtn'),
+  kioskHud: $('kioskHud'), kioskCountdown: $('kioskCountdown'), kioskExitBtn: $('kioskExitBtn'),
+  kioskIntervalSelect: $('kioskIntervalSelect'),
   intel: $('intel'), intelScope: $('intelScope'), leaderboard: $('leaderboard'),
   countryBoard: $('countryBoard'),
   patterns: $('patterns'), patternsTip: $('patternsTip'), patternsScope: $('patternsScope'),
+  matrixContainer: $('matrixContainer'),
   badgeImg: $('badgeImg'), embedMd: $('embedMd'), embedHtml: $('embedHtml'),
   statsLink: $('statsLink'),
   traceCanvas: $('trace'), traceTooltip: $('traceTooltip'),
@@ -72,6 +104,7 @@ let upOffset = 0;
 initTheme();
 const gauge = new Gauge(els.gaugeCanvas);
 const trace = new Trace(els.traceCanvas, els.traceTooltip);
+const pingMonitor = new PingMonitor(els.monitorCanvas, els.monitorList, els.monitorStats);
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -99,71 +132,15 @@ function setState(next) {
   els.againBtn.hidden = !(next === 'done' || next === 'error');
   els.copyBtn.hidden = next !== 'done';
   els.shareBtn.hidden = next !== 'done';
-  els.errorBanner.hidden = next !== 'error';
-  els.phaseChip.hidden = next === 'idle';
-  els.serverSelect.disabled = next === 'running';
-  els.settingsServerSelect.disabled = next === 'running';
-}
-
-function selectedServer() {
-  return SERVERS.find((s) => s.id === getSetting('server')) || SERVERS[0];
-}
-
-function renderMetaChips(meta, loadedRtt) {
-  els.metaChips.textContent = '';
-  const chips = [];
-  if (meta?.ip) chips.push(`IP ${meta.ip}`);
-  if (meta?.asn) chips.push(`AS${meta.asn}`);
-  if (meta?.city) chips.push(meta.city + (meta.country ? `, ${meta.country}` : ''));
-  if (meta?.colo) chips.push(`VIA ${meta.colo}`);
-  if (loadedRtt != null) chips.push(`LOADED RTT ${fmtMs(loadedRtt)} ms`);
-  for (const text of chips) {
-    const li = document.createElement('li');
-    li.textContent = text;
-    els.metaChips.appendChild(li);
+  if (els.disputeBtn) els.disputeBtn.hidden = next !== 'done';
+  if (next !== 'running') {
+    els.phaseChip.hidden = next === 'idle';
   }
-}
-
-function fillDetails(r) {
-  const u = speedUnitLabel();
-  const srvObj = SERVERS.find((s) => s.id === (r.selectedServerId || r.server)) || SERVERS[0];
-  const serverDisplay = r.autoServer
-    ? `⚡ Auto → ${srvObj.label}${r.autoRtt ? ` (${fmtMs(r.autoRtt)} ms latency)` : ''}`
-    : srvObj.label;
-  const isWebSocket = (r.selectedServerId || r.server) === 'mlab';
-  const rows = [
-    ['Server', serverDisplay],
-    ['Download avg', `${fmtMbps(r.down)} ${u}`],
-    ['Download peak', `${fmtMbps(r.downPeak)} ${u}`],
-    ['Data received', `${fmtBytes(r.downBytes)} in ${r.downDur.toFixed(1)} s${isWebSocket ? ' · NDT7 WebSocket' : ' · 5 streams'}`],
-    ['Upload avg', `${fmtMbps(r.up)} ${u}`],
-    ['Upload peak', `${fmtMbps(r.upPeak)} ${u}`],
-    ['Data sent', `${fmtBytes(r.upBytes)} in ${r.upDur.toFixed(1)} s${isWebSocket ? ' · NDT7 WebSocket' : ' · 4 streams'}`],
-    ['Ping (median)', `${fmtMs(r.ping)} ms`],
-    ['Jitter', `${fmtMs(r.jitter)} ms`],
-    ['Loaded RTT', r.loadedRtt != null ? `${fmtMs(r.loadedRtt)} ms` : '—'],
-    ['Packet loss', r.loss != null
-      ? (r.lossMethod === 'tcp_info'
-        ? `${fmtPct(r.loss)} % (TCP retransmissions)`
-        : (r.lossMethod === 'probe'
-          ? `${fmtPct(r.loss)} % (Network probe, ${r.lossReceived}/${r.lossSent} received)`
-          : `${fmtPct(r.loss)} % (UDP, ${r.lossReceived}/${r.lossSent} via TURN relay)`))
-      : ((r.selectedServerId || r.server) === 'local' ? 'not measured for LAN tests' : 'unavailable')],
-    ['ISP', r.geo?.isp || '—'],
-    ['Location', [r.geo?.city, r.geo?.region, r.geo?.postal].filter(Boolean).join(' · ') || '—'],
-  ];
-  els.detailsBody.textContent = '';
-  for (const [k, v] of rows) {
-    const tr = document.createElement('tr');
-    const th = document.createElement('th');
-    th.scope = 'row';
-    th.textContent = k;
-    const td = document.createElement('td');
-    td.textContent = v;
-    tr.append(th, td);
-    els.detailsBody.appendChild(tr);
+  if (next === 'running') {
+    els.errorBanner.hidden = true;
+    if (els.qualitySection) els.qualitySection.hidden = true;
+    if (els.resultTagBar) els.resultTagBar.hidden = true;
   }
-  els.details.hidden = false;
 }
 
 function resetTiles() {
@@ -172,16 +149,95 @@ function resetTiles() {
   }
 }
 
+// Selected server lookup
+function selectedServer() {
+  const chosen = getSetting('server');
+  return SERVERS.find((s) => s.id === chosen) || SERVERS[0];
+}
+
+function renderMetaChips(meta, loadedRtt) {
+  els.metaChips.textContent = '';
+  const chips = [];
+  if (meta?.ip) chips.push({ label: 'IP', val: meta.ip });
+  if (meta?.asn) chips.push({ label: 'ASN', val: `AS${meta.asn}` });
+  if (meta?.colo) chips.push({ label: 'VIA', val: meta.colo });
+  if (loadedRtt != null) chips.push({ label: 'LOADED RTT', val: `${fmtMs(loadedRtt)} ms` });
+  for (const c of chips) {
+    const li = document.createElement('li');
+    li.className = 'meta-chip';
+    const l = document.createElement('span');
+    l.className = 'chip-label';
+    l.textContent = c.label;
+    const v = document.createElement('span');
+    v.className = 'chip-val';
+    v.textContent = c.val;
+    li.append(l, v);
+    els.metaChips.appendChild(li);
+  }
+}
+
+function fillDetails(r) {
+  const u = speedUnitLabel();
+  const rows = [
+    ['Phase', 'Duration', 'Samples', 'Metric'],
+    ['Ping', '—', `${r.pingSamples?.length || 0} pings`, `${fmtMs(r.ping)} ms (jitter ${fmtMs(r.jitter)} ms)`],
+    ['Download', '15.0 s', `${r.downRaw?.length || 0} samples`, `${fmtMbps(r.down)} ${u} (peak ${fmtMbps(r.downPeak)} ${u})`],
+    ['Upload', '15.0 s', `${r.upRaw?.length || 0} samples`, `${fmtMbps(r.up)} ${u} (peak ${fmtMbps(r.upPeak)} ${u})`],
+  ];
+  if (r.loss != null) {
+    rows.push(['Packet loss', '—', r.lossMethod || 'WebRTC relay', `${fmtPct(r.loss)}% loss`]);
+  }
+  if (r.loadedRtt != null) {
+    rows.push(['Loaded RTT', 'under download load', '0-byte pings', `${fmtMs(r.loadedRtt)} ms`]);
+  }
+  els.detailsBody.textContent = '';
+  rows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+    row.forEach((cell) => {
+      const el = document.createElement(i === 0 ? 'th' : 'td');
+      el.textContent = cell;
+      tr.appendChild(el);
+    });
+    els.detailsBody.appendChild(tr);
+  });
+  els.details.hidden = false;
+}
+
+// Result Tag selector chips
+function renderResultTagChips(ts) {
+  if (!els.resultTagChips || !els.resultTagBar) return;
+  els.resultTagChips.innerHTML = '';
+  AVAILABLE_TAGS.forEach((tag) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'tag-chip-btn';
+    btn.textContent = tag;
+    btn.addEventListener('click', () => {
+      updateEntryTag(ts, tag);
+      els.resultTagChips.querySelectorAll('.tag-chip-btn').forEach((b) => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderHistoryList();
+    });
+    els.resultTagChips.appendChild(btn);
+  });
+  els.resultTagBar.hidden = false;
+}
+
 // ---- test run ---------------------------------------------------------------
 
 function start() {
   if (state === 'running') return;
+  unlockAudio();
+  playRelayClick(true);
+
   const server = selectedServer();
   lastDownT = 0;
   upOffset = 0;
   resetTiles();
   trace.reset();
   els.details.hidden = true;
+  if (els.qualitySection) els.qualitySection.hidden = true;
+  if (els.resultTagBar) els.resultTagBar.hidden = true;
   setState('running');
   setPhaseChip(PHASE_LABEL.meta, 'idle');
   setReading('···', '');
@@ -200,24 +256,25 @@ function start() {
       const kind = PHASE_KIND[name] || 'idle';
       if (name !== 'done') setPhaseChip(PHASE_LABEL[name], kind);
       if (name === 'ping') {
-        // Latency runs behind the meter — the gauge stays neutral, the value
-        // lands in the Ping tile below.
         gauge.setKind('idle');
         setReading('···', '');
+        stopThroughputSweep();
         announce('Measuring latency in the background.');
       } else if (name === 'download') {
         gauge.setKind('down');
         gauge.setValue(0);
+        startThroughputSweep('down');
         announce('Measuring download speed.');
       } else if (name === 'upload') {
         upOffset = lastDownT + 1;
         gauge.setKind('up');
         gauge.setValue(0);
+        startThroughputSweep('up');
         announce('Measuring upload speed.');
       } else if (name === 'loss') {
-        // Packet loss also runs behind the meter — result goes to its tile.
         gauge.setKind('idle');
         setReading('···', '');
+        stopThroughputSweep();
         announce('Measuring packet loss over a relay in the background.');
       }
     },
@@ -230,9 +287,8 @@ function start() {
     meta(m) {
       renderMetaChips(m, null);
     },
-    ping(ms, i, n) {
-      // Background test: fill the Ping tile only; the meter is reserved for
-      // Download/Upload.
+    ping(ms) {
+      playProbeTick();
       els.pingVal.textContent = fmtMs(ms);
     },
     sample(kind, t, v) {
@@ -245,9 +301,12 @@ function start() {
     },
     live(kind, mbps) {
       gauge.setValue(mbps);
+      updateThroughputSweep(mbps);
       (kind === 'down' ? els.downVal : els.upVal).textContent = fmtMbps(mbps);
     },
     done(result) {
+      stopThroughputSweep();
+      playCompletionChime();
       lastResult = result;
       els.pingVal.textContent = fmtMs(result.ping);
       els.jitterVal.textContent = fmtMs(result.jitter);
@@ -257,22 +316,30 @@ function start() {
       gauge.setKind('done');
       gauge.stop();
       trace.finish();
-      // Whole dial winds down to rest in graceful slow-motion — needle, arc, and the center numeral.
-      // The result stays in the tiles, details, and history.
+
       gauge.park((v) => setReading(v === 0 ? '0' : fmtMbps(v), speedUnitLabel()));
       setPhaseChip(PHASE_LABEL.done, 'down');
       renderMetaChips(result.meta, result.loadedRtt);
       fillDetails(result);
-      renderHistory(els.historyList, saveResult(result), onDeleteEntry);
+
+      // Feature 1: Connection Quality & Bufferbloat Grades
+      renderQualityCard(els.qualitySection, result);
+
+      // Save result to history and render tag chips
+      saveResult(result);
+      renderHistoryList();
+      renderResultTagChips(result.ts);
+
       setState('done');
-      // Community layer: share (only real-internet tests carry real ISP truth)
-      // then refresh the leaderboard/outage/patterns for this connection.
+
+      // Community submission
       const srv = SERVERS.find((s) => s.id === (result.selectedServerId || result.server));
       if (srv?.internet && result.geo) {
         submitResult(result).finally(() => loadIntel(result.geo));
       } else if (result.geo || currentGeo) {
         loadIntel(result.geo || currentGeo);
       }
+
       const unitWord = getSetting('speed') === 'kbps' ? 'kilobits per second' : 'megabits per second';
       announce(
         `Test complete. Download ${fmtMbps(result.down)} ${unitWord}, `
@@ -280,8 +347,13 @@ function start() {
         + `ping ${fmtMs(result.ping)} milliseconds`
         + (result.loss != null ? `, packet loss ${fmtPct(result.loss)} percent.` : '.'),
       );
+
+      // Kiosk auto-repeat scheduler
+      scheduleKioskLoop();
     },
     error(err, phase) {
+      stopThroughputSweep();
+      playRelayClick(false);
       gauge.stop();
       gauge.park();
       trace.finish();
@@ -294,6 +366,8 @@ function start() {
       announce(els.errorText.textContent);
     },
     aborted() {
+      stopThroughputSweep();
+      playRelayClick(false);
       gauge.setKind('idle');
       gauge.stop();
       trace.finish();
@@ -308,7 +382,7 @@ function start() {
 // ---- network intel ----------------------------------------------------------
 
 let currentGeo = null;
-let lastIntel = null; // { lb, pat, out, g, patScope } — cached so unit changes re-render without refetch
+let lastIntel = null;
 const patternsChart = new PatternsChart(els.patterns, els.patternsTip);
 
 function showIspLine(g) {
@@ -319,34 +393,20 @@ function showIspLine(g) {
   els.ispLine.hidden = false;
 }
 
-// Re-render the community panel from cached data (used on settings change so a
-// unit switch updates the numbers without hitting the network again).
 function renderIntelFromCache() {
   if (!lastIntel) return;
-  const {
-    lb, pat, out, g, patScope, ctry,
-  } = lastIntel;
-  renderOutage(els.outage, out, g);
-  renderLeaderboard(els.leaderboard, lb, g.isp);
-  renderCountryBoard(els.countryBoard, ctry, g);
-  // demo:true means the scope has no real community reports yet and the numbers
-  // are sample/seed data — label it plainly so it's never mistaken for real
-  // crowdsourced data. The server never blends demo and real (see worker.js).
-  els.intelScope.textContent = lb
-    ? (lb.demo
-      ? `${g.city} · sample data — no community reports yet · last ${lb.scope.windowDays} days`
-      : `${g.city} · last ${lb.scope.windowDays} days · ${lb.scope.samples} community reports`)
-    : '';
-  if (pat) {
-    patternsChart.setData(pat.hours);
-    els.patternsScope.textContent = pat.scope.samples
-      ? `${patScope} · ${g.city} · ${pat.scope.samples} reports${pat.demo ? ' · sample data' : ''}`
-      : `${g.city} · no reports yet`;
-  }
+  const { lb, pat, out, g, patScope, ctry } = lastIntel;
+  if (lb) renderLeaderboard(els.leaderboard, lb, g?.isp);
+  if (ctry) renderCountryBoard(els.countryBoard, ctry, g?.country);
+  if (pat) patternsChart.setData(pat.hours || pat);
+  if (out) renderOutage(els.outage, out, g?.isp);
+  els.patternsScope.textContent = patScope ? `scope: ${patScope}` : '';
+  const place = [g?.city, g?.region, g?.country].filter(Boolean).join(', ');
+  els.intelScope.textContent = place ? `local: ${place}` : '';
 }
 
 async function loadIntel(g) {
-  if (!g?.city) { els.intel.hidden = true; return; }
+  if (!g?.city && !g?.isp) return;
   let [lb, pat, out, ctry] = await Promise.all([
     fetchLeaderboard({ city: g.city }),
     fetchPatterns({ isp: g.isp, city: g.city }),
@@ -355,16 +415,13 @@ async function loadIntel(g) {
   ]);
   let patScope = g.isp || 'All ISPs';
   if (pat && g.isp && pat.scope.samples < 12) {
-    // An ISP with almost no reports makes an empty chart — widen to city-wide.
     const cityWide = await fetchPatterns({ city: g.city });
     if (cityWide && cityWide.scope.samples > pat.scope.samples) {
       pat = cityWide;
       patScope = 'All ISPs';
     }
   }
-  lastIntel = {
-    lb, pat, out, g, patScope, ctry,
-  };
+  lastIntel = { lb, pat, out, g, patScope, ctry };
   renderIntelFromCache();
   const embed = embedFor(g, location.origin);
   els.badgeImg.src = embed.badge;
@@ -372,6 +429,26 @@ async function loadIntel(g) {
   els.embedHtml.value = embed.html;
   els.statsLink.href = embed.stats;
   els.intel.hidden = false;
+}
+
+// Global Matrix & DNS Benchmark Runner
+let matrixCached = null;
+async function loadMatrixAndDns(force = false) {
+  if (matrixCached && !force) return;
+  els.matrixContainer.innerHTML = '<p class="matrix-loading">Measuring transit hops and DNS resolvers...</p>';
+  try {
+    const [ipv6, matrixResults, dnsResults] = await Promise.all([
+      checkIpv6Support(),
+      runGlobalPingMatrix(),
+      runDnsBenchmark(),
+    ]);
+    matrixCached = { ipv6, matrixResults, dnsResults };
+    renderMatrixView(els.matrixContainer, matrixResults, dnsResults, ipv6);
+    const refreshBtn = $('matrixRefreshBtn');
+    if (refreshBtn) refreshBtn.addEventListener('click', () => loadMatrixAndDns(true));
+  } catch (err) {
+    els.matrixContainer.innerHTML = `<p class="matrix-loading">Matrix error: ${err.message}</p>`;
+  }
 }
 
 // Tabs
@@ -384,13 +461,13 @@ for (const tab of document.querySelectorAll('.intel-tab')) {
       view.hidden = view.dataset.panel !== tab.dataset.tab;
     }
     if (tab.dataset.tab === 'patterns') patternsChart.resize();
+    if (tab.dataset.tab === 'matrix') loadMatrixAndDns();
   });
 }
 for (const input of [els.embedMd, els.embedHtml]) {
   input.addEventListener('focus', () => input.select());
 }
 
-// Detect ISP/city at load so the community intel shows before the first run.
 detectIsp().then((g) => {
   showIspLine(g);
   if (g) loadIntel(g);
@@ -412,6 +489,22 @@ els.themeBtn.setAttribute(
   `Switch to ${currentTheme() === 'dark' ? 'light' : 'dark'} theme`,
 );
 
+// Audio toggle in topbar
+function syncSoundBtn() {
+  const isSoundOn = getSetting('sound') !== 'off';
+  els.soundBtn.textContent = isSoundOn ? '🔊' : '🔇';
+  els.soundBtn.setAttribute('aria-label', isSoundOn ? 'Mute sound effects' : 'Enable sound effects');
+}
+els.soundBtn.addEventListener('click', () => {
+  unlockAudio();
+  const next = getSetting('sound') === 'on' ? 'off' : 'on';
+  setSetting('sound', next);
+  syncSoundBtn();
+  playRelayClick();
+});
+syncSoundBtn();
+
+// Copy result
 els.copyBtn.addEventListener('click', async () => {
   if (!lastResult) return;
   const r = lastResult;
@@ -429,8 +522,7 @@ els.copyBtn.addEventListener('click', async () => {
   }
 });
 
-// Server selection — settings is the single source of truth; the footer picker
-// and the Settings dialog both read/write it and stay in sync via settingschange.
+// Server selection
 function populateServerSelect(sel) {
   for (const s of SERVERS) {
     const opt = document.createElement('option');
@@ -442,38 +534,328 @@ function populateServerSelect(sel) {
 populateServerSelect(els.serverSelect);
 populateServerSelect(els.settingsServerSelect);
 
-// One-time migration from the pre-settings standalone key.
-try {
-  const legacy = localStorage.getItem('speedundo.server');
-  if (legacy && SERVERS.some((s) => s.id === legacy)) setSetting('server', legacy);
-  localStorage.removeItem('speedundo.server');
-} catch (_) { /* ignore */ }
-
-function currentServerId() {
-  const id = getSetting('server');
-  return SERVERS.some((s) => s.id === id) ? id : SERVERS[0].id;
-}
 function applyServerToUI() {
-  const id = currentServerId();
+  const id = getSetting('server');
   els.serverSelect.value = id;
   els.settingsServerSelect.value = id;
-  els.settingsServerName.textContent = (SERVERS.find((s) => s.id === id) || SERVERS[0]).label;
+  const s = selectedServer();
+  els.settingsServerName.textContent = s.label;
 }
 
 els.serverSelect.addEventListener('change', () => setSetting('server', els.serverSelect.value));
-els.settingsServerSelect.addEventListener('change', () => setSetting('server', els.settingsServerSelect.value));
-els.settingsChangeServer.addEventListener('click', () => {
-  const revealing = els.settingsServerSelect.hidden;
-  els.settingsServerSelect.hidden = !revealing;
-  els.settingsChangeServer.textContent = revealing ? 'Done' : 'Change Server';
-  if (revealing) els.settingsServerSelect.focus();
+els.settingsServerSelect.addEventListener('change', () => {
+  setSetting('server', els.settingsServerSelect.value);
+  applyServerToUI();
+  els.settingsServerSelect.hidden = true;
+  els.settingsChangeServer.textContent = 'Change Server';
 });
 
-// History drawer
-let lastFocus = null;
-const inertTargets = () => document.querySelectorAll('.topbar, .app');
+els.settingsChangeServer.addEventListener('click', () => {
+  const isHidden = els.settingsServerSelect.hidden;
+  els.settingsServerSelect.hidden = !isHidden;
+  els.settingsChangeServer.textContent = isHidden ? 'Done' : 'Change Server';
+  if (isHidden) els.settingsServerSelect.focus();
+});
+
+// ---- Feature 2: ISP Dispute Report Modal ------------------------------------
+
+els.disputeBtn.addEventListener('click', () => {
+  if (!lastResult) return;
+  openDisputeModal(els.disputeModal, els.disputeBackdrop, lastResult);
+});
+els.disputeClose.addEventListener('click', () => closeDisputeModal(els.disputeModal, els.disputeBackdrop));
+els.disputeBackdrop.addEventListener('click', () => closeDisputeModal(els.disputeModal, els.disputeBackdrop));
+els.disputePrint.addEventListener('click', () => window.print());
+els.disputeCopy.addEventListener('click', async () => {
+  if (!lastResult) return;
+  try {
+    await copyDisputeReport(lastResult);
+    flashBtn(els.disputeCopy, 'Copied Ticket ✓', 'Copy Markdown Ticket');
+  } catch (_) {
+    flashBtn(els.disputeCopy, 'Copy Failed', 'Copy Markdown Ticket');
+  }
+});
+els.disputeDownload.addEventListener('click', () => {
+  if (lastResult) downloadDisputeReport(lastResult);
+});
+
+// ---- Feature 3: Ping Pulse & Stability Monitor Modal -----------------------
+
+function openMonitor() {
+  els.monitorModal.hidden = false;
+  els.monitorBackdrop.hidden = false;
+  pingMonitor.start();
+  els.monitorToggleBtn.textContent = 'Pause';
+}
+function closeMonitor() {
+  els.monitorModal.hidden = true;
+  els.monitorBackdrop.hidden = true;
+  pingMonitor.stop();
+}
+
+els.monitorBtn.addEventListener('click', openMonitor);
+els.monitorClose.addEventListener('click', closeMonitor);
+els.monitorBackdrop.addEventListener('click', closeMonitor);
+els.monitorToggleBtn.addEventListener('click', () => {
+  if (pingMonitor.running) {
+    pingMonitor.stop();
+    els.monitorToggleBtn.textContent = 'Resume';
+  } else {
+    pingMonitor.start();
+    els.monitorToggleBtn.textContent = 'Pause';
+  }
+});
+els.monitorClearBtn.addEventListener('click', () => pingMonitor.clear());
+els.monitorExportBtn.addEventListener('click', () => pingMonitor.exportCsv());
+
+// ---- Feature 4: History Tagging, Compare & CSV Export ----------------------
+
+const selectedToCompare = new Set();
+
+function updateCompareButton() {
+  const count = selectedToCompare.size;
+  els.compareBtn.textContent = `Compare (${count}/2)`;
+  els.compareBtn.disabled = count !== 2;
+}
+
+function renderHistoryList() {
+  const entries = loadHistory();
+  renderHistory(
+    els.historyList,
+    entries,
+    onDeleteEntry,
+    (ts, tag) => {
+      updateEntryTag(ts, tag);
+      renderHistoryList();
+    },
+    (ts, checked) => {
+      if (checked) {
+        if (selectedToCompare.size >= 2) {
+          // Keep max 2
+          const first = selectedToCompare.values().next().value;
+          selectedToCompare.delete(first);
+        }
+        selectedToCompare.add(ts);
+      } else {
+        selectedToCompare.delete(ts);
+      }
+      // Re-sync check states in DOM
+      els.historyList.querySelectorAll('.history-chk').forEach((chk) => {
+        const row = chk.closest('.history-row');
+        if (row) {
+          const rowTs = Number(row.dataset.ts);
+          chk.checked = selectedToCompare.has(rowTs);
+        }
+      });
+      updateCompareButton();
+    },
+  );
+  // Restore checked boxes
+  els.historyList.querySelectorAll('.history-chk').forEach((chk) => {
+    const row = chk.closest('.history-row');
+    if (row) {
+      const rowTs = Number(row.dataset.ts);
+      chk.checked = selectedToCompare.has(rowTs);
+    }
+  });
+  updateCompareButton();
+}
+
+function onDeleteEntry(ts) {
+  selectedToCompare.delete(ts);
+  deleteEntry(ts);
+  renderHistoryList();
+}
+
+els.exportCsvBtn.addEventListener('click', () => exportHistoryCsv());
+
+els.compareBtn.addEventListener('click', () => {
+  if (selectedToCompare.size !== 2) return;
+  const entries = loadHistory();
+  const [ts1, ts2] = Array.from(selectedToCompare);
+  const itemA = entries.find((e) => e.ts === ts1);
+  const itemB = entries.find((e) => e.ts === ts2);
+  if (!itemA || !itemB) return;
+
+  const diff = computeComparison(itemA, itemB);
+  const u = speedUnitLabel();
+
+  els.compareContent.innerHTML = `
+    <table class="compare-table">
+      <thead>
+        <tr>
+          <th>Metric</th>
+          <th>Run A (${fmtDateTime(itemA.ts)}) ${itemA.tag ? `[${itemA.tag}]` : ''}</th>
+          <th>Run B (${fmtDateTime(itemB.ts)}) ${itemB.tag ? `[${itemB.tag}]` : ''}</th>
+          <th>Delta (B vs A)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Download</td>
+          <td>${fmtMbps(itemA.down)} ${u}</td>
+          <td>${fmtMbps(itemB.down)} ${u}</td>
+          <td class="${diff.down.class}">${diff.down.diff} ${u} (${diff.down.pct})</td>
+        </tr>
+        <tr>
+          <td>Upload</td>
+          <td>${fmtMbps(itemA.up)} ${u}</td>
+          <td>${fmtMbps(itemB.up)} ${u}</td>
+          <td class="${diff.up.class}">${diff.up.diff} ${u} (${diff.up.pct})</td>
+        </tr>
+        <tr>
+          <td>Ping</td>
+          <td>${fmtMs(itemA.ping)} ms</td>
+          <td>${fmtMs(itemB.ping)} ms</td>
+          <td class="${diff.ping.class}">${diff.ping.diff} ms (${diff.ping.pct})</td>
+        </tr>
+        <tr>
+          <td>Jitter</td>
+          <td>${fmtMs(itemA.jitter)} ms</td>
+          <td>${fmtMs(itemB.jitter)} ms</td>
+          <td class="${diff.jitter.class}">${diff.jitter.diff} ms (${diff.jitter.pct})</td>
+        </tr>
+        <tr>
+          <td>Packet Loss</td>
+          <td>${itemA.loss != null ? fmtPct(itemA.loss) + '%' : '0.0%'}</td>
+          <td>${itemB.loss != null ? fmtPct(itemB.loss) + '%' : '0.0%'}</td>
+          <td class="${diff.loss.class}">${diff.loss.diff}%</td>
+        </tr>
+        <tr>
+          <td>Loaded RTT</td>
+          <td>${itemA.loadedRtt != null ? fmtMs(itemA.loadedRtt) + ' ms' : '—'}</td>
+          <td>${itemB.loadedRtt != null ? fmtMs(itemB.loadedRtt) + ' ms' : '—'}</td>
+          <td class="${diff.loaded.class}">${diff.loaded.diff !== '—' ? diff.loaded.diff + ' ms' : '—'}</td>
+        </tr>
+      </tbody>
+    </table>
+  `;
+
+  els.compareModal.hidden = false;
+  els.compareBackdrop.hidden = false;
+});
+
+els.compareClose.addEventListener('click', () => {
+  els.compareModal.hidden = true;
+  els.compareBackdrop.hidden = true;
+});
+els.compareBackdrop.addEventListener('click', () => {
+  els.compareModal.hidden = true;
+  els.compareBackdrop.hidden = true;
+});
+
+// ---- Feature 7: Fullscreen Kiosk / TV NOC Mode -----------------------------
+
+let kioskTimer = null;
+let kioskCountdownSeconds = 0;
+let wakeLock = null;
+
+async function requestScreenWakeLock() {
+  try {
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+    }
+  } catch (_) {}
+}
+
+function releaseScreenWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+
+function toggleKioskMode(force = null) {
+  const active = force !== null ? force : !document.body.classList.contains('kiosk-mode');
+  if (active) {
+    document.body.classList.add('kiosk-mode');
+    requestScreenWakeLock();
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch(() => {});
+    }
+    updateKioskHud();
+  } else {
+    document.body.classList.remove('kiosk-mode');
+    releaseScreenWakeLock();
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    }
+    if (kioskTimer) {
+      clearInterval(kioskTimer);
+      kioskTimer = null;
+    }
+    els.kioskHud.hidden = true;
+  }
+}
+
+function parseKioskInterval() {
+  const val = getSetting('kioskInterval') || 'off';
+  const mins = { '5m': 5, '15m': 15, '30m': 30, '60m': 60 }[val];
+  return mins ? mins * 60 : 0;
+}
+
+function scheduleKioskLoop() {
+  if (kioskTimer) {
+    clearInterval(kioskTimer);
+    kioskTimer = null;
+  }
+  const intervalSec = parseKioskInterval();
+  if (!intervalSec) {
+    els.kioskHud.hidden = true;
+    return;
+  }
+
+  kioskCountdownSeconds = intervalSec;
+  updateKioskHud();
+
+  kioskTimer = setInterval(() => {
+    kioskCountdownSeconds--;
+    if (kioskCountdownSeconds <= 0) {
+      clearInterval(kioskTimer);
+      kioskTimer = null;
+      start();
+    } else {
+      updateKioskHud();
+    }
+  }, 1000);
+}
+
+function updateKioskHud() {
+  const intervalSec = parseKioskInterval();
+  if (!intervalSec) {
+    els.kioskHud.hidden = true;
+    return;
+  }
+  els.kioskHud.hidden = false;
+  const m = Math.floor(kioskCountdownSeconds / 60);
+  const s = kioskCountdownSeconds % 60;
+  els.kioskCountdown.textContent = `Next test in ${m}:${s < 10 ? '0' : ''}${s}`;
+}
+
+els.kioskBtn.addEventListener('click', () => toggleKioskMode());
+els.kioskExitBtn.addEventListener('click', () => toggleKioskMode(false));
+
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'f' || e.key === 'F') && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+    toggleKioskMode();
+  }
+  if (e.key === 'Escape') {
+    if (!els.disputeModal.hidden) closeDisputeModal(els.disputeModal, els.disputeBackdrop);
+    if (!els.monitorModal.hidden) closeMonitor();
+    if (!els.compareModal.hidden) {
+      els.compareModal.hidden = true;
+      els.compareBackdrop.hidden = true;
+    }
+  }
+});
+
+// Drawer (history)
+function inertTargets() {
+  return [document.querySelector('.topbar'), document.querySelector('.app')].filter(Boolean);
+}
+
 function openDrawer() {
-  lastFocus = document.activeElement;
+  renderHistoryList();
   els.drawer.hidden = false;
   els.backdrop.hidden = false;
   for (const el of inertTargets()) el.inert = true;
@@ -483,6 +865,7 @@ function openDrawer() {
   });
   els.drawerClose.focus();
 }
+
 function closeDrawer() {
   els.drawer.classList.remove('open');
   els.backdrop.classList.remove('open');
@@ -491,30 +874,38 @@ function closeDrawer() {
     els.drawer.hidden = true;
     els.backdrop.hidden = true;
   }, 240);
-  if (lastFocus) lastFocus.focus();
+  els.historyBtn.focus();
 }
+
 els.historyBtn.addEventListener('click', openDrawer);
 els.drawerClose.addEventListener('click', closeDrawer);
 els.backdrop.addEventListener('click', closeDrawer);
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !els.drawer.hidden) closeDrawer();
-});
 els.clearBtn.addEventListener('click', () => {
   clearHistory();
-  renderHistory(els.historyList, [], onDeleteEntry);
+  selectedToCompare.clear();
+  renderHistoryList();
 });
-function onDeleteEntry(ts) {
-  renderHistory(els.historyList, deleteEntry(ts), onDeleteEntry);
-}
-renderHistory(els.historyList, loadHistory(), onDeleteEntry);
 
-// Share modal
-let shareLastFocus = null;
+// Share dialog
+function flashBtn(btn, text, restore) {
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = restore; }, 1800);
+}
+
 function openShare() {
   if (!lastResult) return;
-  shareLastFocus = document.activeElement;
   drawCard(els.shareCard, lastResult);
   els.shareCaption.value = defaultCaption(lastResult);
+  renderNetworkButtons(
+    els.shareNets,
+    () => els.shareCaption.value,
+    () => copyCardToClipboard(els.shareCard),
+    (ok) => {
+      els.shareNote.textContent = ok
+        ? 'Card image copied to clipboard! Paste it into your post.'
+        : 'Clipboard unavailable — use "Download image" and attach it to the post.';
+    },
+  );
   els.shareModal.hidden = false;
   els.shareBackdrop.hidden = false;
   for (const el of inertTargets()) el.inert = true;
@@ -522,9 +913,9 @@ function openShare() {
     els.shareModal.classList.add('open');
     els.shareBackdrop.classList.add('open');
   });
-  els.shareNative.hidden = !navigator.share;
   els.shareClose.focus();
 }
+
 function closeShare() {
   els.shareModal.classList.remove('open');
   els.shareBackdrop.classList.remove('open');
@@ -533,29 +924,12 @@ function closeShare() {
     els.shareModal.hidden = true;
     els.shareBackdrop.hidden = true;
   }, 240);
-  if (shareLastFocus) shareLastFocus.focus();
+  els.shareBtn.focus();
 }
-const flashBtn = (btn, msg, orig) => {
-  btn.textContent = msg;
-  setTimeout(() => { btn.textContent = orig; }, 1800);
-};
-renderNetworkButtons(
-  els.shareNets,
-  () => els.shareCaption.value,
-  async () => {
-    // Intent URLs can't carry the image — put it on the clipboard first.
-    const ok = await copyCardToClipboard(els.shareCard);
-    els.shareNote.textContent = ok
-      ? 'Image copied to your clipboard — paste it into the post beside the caption.'
-      : 'Clipboard unavailable — use "Download image" and attach it to the post.';
-  },
-);
+
 els.shareBtn.addEventListener('click', openShare);
 els.shareClose.addEventListener('click', closeShare);
 els.shareBackdrop.addEventListener('click', closeShare);
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !els.shareModal.hidden) closeShare();
-});
 els.shareDownload.addEventListener('click', () => {
   if (lastResult) downloadCard(els.shareCard, lastResult);
 });
@@ -570,9 +944,8 @@ window.addEventListener('themechange', () => {
   if (!els.shareModal.hidden && lastResult) drawCard(els.shareCard, lastResult);
 });
 
-// ---- settings ---------------------------------------------------------------
+// ---- Settings ---------------------------------------------------------------
 
-// Reflect the stored settings onto the dialog controls.
 function syncSettingsControls() {
   const s = getSettings();
   for (const seg of document.querySelectorAll('.seg[data-setting]')) {
@@ -582,10 +955,11 @@ function syncSettingsControls() {
     }
   }
   els.dateFormat.value = s.date;
+  if (els.kioskIntervalSelect) els.kioskIntervalSelect.value = s.kioskInterval || 'off';
   applyServerToUI();
+  syncSoundBtn();
 }
 
-// Push the active speed-unit label into every static label + the live readout.
 function applySpeedUnitLabels() {
   const label = speedUnitLabel();
   for (const el of document.querySelectorAll('.js-speed-unit')) el.textContent = label;
@@ -594,7 +968,6 @@ function applySpeedUnitLabels() {
   }
 }
 
-// Re-render everything that shows a speed/date so a settings change is instant.
 function refreshDisplaysForSettings() {
   applySpeedUnitLabels();
   if (lastResult) {
@@ -604,10 +977,14 @@ function refreshDisplaysForSettings() {
     els.jitterVal.textContent = fmtMs(lastResult.jitter);
     els.lossVal.textContent = lastResult.loss != null ? fmtPct(lastResult.loss) : '—';
     if (!els.details.hidden) fillDetails(lastResult);
+    if (els.qualitySection && !els.qualitySection.hidden) {
+      renderQualityCard(els.qualitySection, lastResult);
+    }
   }
-  renderHistory(els.historyList, loadHistory(), onDeleteEntry);
+  renderHistoryList();
   renderIntelFromCache();
   if (!els.shareModal.hidden && lastResult) drawCard(els.shareCard, lastResult);
+  syncSoundBtn();
 }
 
 let settingsLastFocus = null;
@@ -625,6 +1002,7 @@ function openSettings() {
   });
   els.settingsClose.focus();
 }
+
 function closeSettings() {
   els.settingsModal.classList.remove('open');
   els.settingsBackdrop.classList.remove('open');
@@ -635,12 +1013,10 @@ function closeSettings() {
   }, 240);
   if (settingsLastFocus) settingsLastFocus.focus();
 }
+
 els.settingsBtn.addEventListener('click', openSettings);
 els.settingsClose.addEventListener('click', closeSettings);
 els.settingsBackdrop.addEventListener('click', closeSettings);
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !els.settingsModal.hidden) closeSettings();
-});
 
 for (const seg of document.querySelectorAll('.seg[data-setting]')) {
   seg.addEventListener('click', (e) => {
@@ -649,6 +1025,12 @@ for (const seg of document.querySelectorAll('.seg[data-setting]')) {
   });
 }
 els.dateFormat.addEventListener('change', () => setSetting('date', els.dateFormat.value));
+if (els.kioskIntervalSelect) {
+  els.kioskIntervalSelect.addEventListener('change', () => {
+    setSetting('kioskInterval', els.kioskIntervalSelect.value);
+    scheduleKioskLoop();
+  });
+}
 
 window.addEventListener('settingschange', () => {
   syncSettingsControls();
@@ -660,3 +1042,4 @@ setState('idle');
 setReading('—', '');
 syncSettingsControls();
 applySpeedUnitLabels();
+renderHistoryList();

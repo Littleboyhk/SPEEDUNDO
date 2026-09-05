@@ -1,7 +1,6 @@
-// Global user settings — time/date format, distance + speed units, and the
-// selected test server. Persisted to localStorage and broadcast via a
-// 'settingschange' window event so every view can re-render. Guarded so the
-// pure helpers (format.js) can be imported and unit-tested outside a browser.
+// Global user settings — time/date format, distance + speed units, sound effects,
+// kiosk auto-loop interval, and the selected test server.
+// Persisted to localStorage and broadcast via a 'settingschange' window event.
 
 const KEY = 'speedundo.settings';
 
@@ -11,15 +10,18 @@ export const DEFAULTS = {
   distance: 'mi', // 'mi' | 'km'
   speed: 'mbps', // 'mbps' | 'kbps'
   server: 'auto', // 'auto' | one of engine.js SERVERS ids
+  sound: 'on', // 'on' | 'off'
+  volume: 0.35, // 0.0 to 1.0
+  kioskInterval: 'off', // 'off' | '5m' | '15m' | '30m' | '60m'
 };
 
-// Allowed values for the enum settings ('server' is validated by the caller
-// against the live SERVERS list, so it is intentionally absent here).
 const VALID = {
   time: ['12h', '24h'],
   date: ['MDY', 'DMY', 'YMD'],
   distance: ['mi', 'km'],
   speed: ['mbps', 'kbps'],
+  sound: ['on', 'off'],
+  kioskInterval: ['off', '5m', '15m', '30m', '60m'],
 };
 
 function hasLS() {
@@ -56,6 +58,11 @@ export function getSetting(key) { return current[key]; }
 export function setSetting(key, value) {
   if (!(key in DEFAULTS)) return false;
   if (VALID[key] && !VALID[key].includes(value)) return false;
+  if (key === 'volume') {
+    const num = Number(value);
+    if (!Number.isFinite(num) || num < 0 || num > 1) return false;
+    value = num;
+  }
   if (current[key] === value) return false;
   current[key] = value;
   save();

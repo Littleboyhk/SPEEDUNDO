@@ -39,7 +39,10 @@
       <span class="brand-name">SPEEDUNDO</span>
     </a>
     <nav class="topbar-actions" aria-label="App">
+      <button type="button" id="monitorBtn" class="btn btn-ghost" title="Continuous Line Stability Monitor">Pulse</button>
       <button type="button" id="historyBtn" class="btn btn-ghost">History</button>
+      <button type="button" id="soundBtn" class="btn btn-icon" aria-label="Toggle sound effects" title="Audio Effects (On/Off)">🔊</button>
+      <button type="button" id="kioskBtn" class="btn btn-icon" aria-label="Fullscreen Kiosk mode" title="Fullscreen Kiosk (F)">⛶</button>
       <button type="button" id="settingsBtn" class="btn btn-icon" aria-label="Settings">⚙</button>
       <button type="button" id="themeBtn" class="btn btn-icon" aria-label="Switch theme">◐</button>
     </nav>
@@ -68,6 +71,7 @@
         <button type="button" id="stopBtn" class="btn btn-ghost" hidden>Stop</button>
         <button type="button" id="againBtn" class="btn btn-primary" hidden>Test again</button>
         <button type="button" id="shareBtn" class="btn btn-ghost" hidden>Share result</button>
+        <button type="button" id="disputeBtn" class="btn btn-ghost" hidden>ISP Report</button>
         <button type="button" id="copyBtn" class="btn btn-ghost" hidden>Copy result</button>
       </div>
 
@@ -82,6 +86,12 @@
         <span id="ispName">—</span>
         <span id="ispWhere" class="isp-where"></span>
       </p>
+
+      <!-- Current result tag selector chips -->
+      <div id="resultTagBar" class="result-tag-bar" hidden>
+        <span class="result-tag-lbl">TAG RUN:</span>
+        <div class="result-tag-chips" id="resultTagChips"></div>
+      </div>
     </section>
 
     <div id="outage" class="outage" role="status" hidden></div>
@@ -110,6 +120,9 @@
       </div>
     </section>
 
+    <!-- Connection Quality & Real-World Suitability Grades -->
+    <section id="qualitySection" class="quality-section" aria-label="Connection Quality" hidden></section>
+
     <!-- Scope trace -->
     <section class="scope" aria-label="Throughput over time">
       <div class="scope-head">
@@ -132,7 +145,7 @@
       </details>
     </section>
 
-    <!-- Network intel (crowdsourced) -->
+    <!-- Network intel (crowdsourced + diagnostics) -->
     <section class="intel" id="intel" aria-label="Network intel" hidden>
       <div class="intel-head">
         <h2 class="intel-title">Network intel</h2>
@@ -140,6 +153,7 @@
           <button type="button" class="intel-tab" role="tab" id="tab-leaderboard" data-tab="leaderboard" aria-selected="true">City leaderboard</button>
           <button type="button" class="intel-tab" role="tab" id="tab-countries" data-tab="countries" aria-selected="false">By country</button>
           <button type="button" class="intel-tab" role="tab" id="tab-patterns" data-tab="patterns" aria-selected="false">Time of day</button>
+          <button type="button" class="intel-tab" role="tab" id="tab-matrix" data-tab="matrix" aria-selected="false">Global matrix &amp; DNS</button>
           <button type="button" class="intel-tab" role="tab" id="tab-embed" data-tab="embed" aria-selected="false">Embed &amp; API</button>
         </div>
       </div>
@@ -160,6 +174,12 @@
           <div id="patternsTip" class="trace-tooltip" hidden></div>
         </div>
         <p class="patterns-note">Median download by hour of day (server local time). Lower bars are congestion.</p>
+      </div>
+
+      <div class="intel-view" data-panel="matrix" role="tabpanel" aria-labelledby="tab-matrix" hidden>
+        <div id="matrixContainer" class="matrix-container">
+          <p class="matrix-loading">Measuring transit hops and DNS resolvers...</p>
+        </div>
       </div>
 
       <div class="intel-view" data-panel="embed" role="tabpanel" aria-labelledby="tab-embed" hidden>
@@ -187,6 +207,13 @@
     </footer>
 
   </main>
+
+  <!-- Kiosk interval HUD -->
+  <div id="kioskHud" class="kiosk-hud" hidden>
+    <span class="kiosk-hud-icon">⚡</span>
+    <span id="kioskCountdown">Next run in 5:00</span>
+    <button type="button" id="kioskExitBtn" class="btn btn-ghost btn-sm">Exit Kiosk</button>
+  </div>
 
   <!-- History drawer -->
   <div id="backdrop" class="backdrop" hidden></div>
@@ -257,6 +284,25 @@
         </div>
       </div>
 
+      <div class="setting-row">
+        <span class="setting-label" id="lbl-sound">Sound Effects</span>
+        <div class="seg" role="group" aria-labelledby="lbl-sound" data-setting="sound">
+          <button type="button" class="seg-opt" data-value="on">On</button>
+          <button type="button" class="seg-opt" data-value="off">Muted</button>
+        </div>
+      </div>
+
+      <div class="setting-row">
+        <label class="setting-label" for="kioskIntervalSelect">Auto-Repeat Loop</label>
+        <select id="kioskIntervalSelect" class="setting-select" data-setting="kioskInterval">
+          <option value="off">Off (Manual)</option>
+          <option value="5m">Every 5 min</option>
+          <option value="15m">Every 15 min</option>
+          <option value="30m">Every 30 min</option>
+          <option value="60m">Every 60 min</option>
+        </select>
+      </div>
+
       <div class="setting-row setting-row-top">
         <span class="setting-label">Server</span>
         <div class="setting-server">
@@ -268,16 +314,71 @@
     </div>
   </div>
 
+  <!-- History drawer -->
   <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-label="Test history" hidden>
     <header class="drawer-head">
       <h2>History</h2>
       <div class="drawer-actions">
-        <button type="button" id="clearBtn" class="btn btn-ghost">Clear all</button>
+        <button type="button" id="compareBtn" class="btn btn-ghost btn-sm" disabled>Compare (0/2)</button>
+        <button type="button" id="exportCsvBtn" class="btn btn-ghost btn-sm">Export CSV</button>
+        <button type="button" id="clearBtn" class="btn btn-ghost btn-sm">Clear all</button>
         <button type="button" id="drawerClose" class="btn btn-icon" aria-label="Close history">✕</button>
       </div>
     </header>
     <div id="historyList" class="history-list"></div>
   </aside>
+
+  <!-- Side-by-Side Comparison Modal -->
+  <div id="compareBackdrop" class="backdrop" hidden></div>
+  <div id="compareModal" class="compare-modal" role="dialog" aria-modal="true" aria-label="Test Comparison" hidden>
+    <header class="compare-head">
+      <h2>Side-by-Side Run Comparison</h2>
+      <button type="button" id="compareClose" class="btn btn-icon" aria-label="Close comparison dialog">✕</button>
+    </header>
+    <div id="compareContent" class="compare-content"></div>
+  </div>
+
+  <!-- ISP Dispute Report Modal -->
+  <div id="disputeBackdrop" class="backdrop" hidden></div>
+  <div id="disputeModal" class="dispute-modal" role="dialog" aria-modal="true" aria-label="ISP Telemetry Audit" hidden>
+    <header class="dispute-head">
+      <h2>ISP Telemetry Audit &amp; Dispute Report</h2>
+      <button type="button" id="disputeClose" class="btn btn-icon" aria-label="Close dispute dialog">✕</button>
+    </header>
+    <div class="dispute-body">
+      <pre id="disputePreview" class="dispute-preview"></pre>
+    </div>
+    <footer class="dispute-actions">
+      <button type="button" id="disputePrint" class="btn btn-primary">Print / Save PDF</button>
+      <button type="button" id="disputeCopy" class="btn btn-ghost">Copy Markdown Ticket</button>
+      <button type="button" id="disputeDownload" class="btn btn-ghost">Download TXT</button>
+    </footer>
+  </div>
+
+  <!-- Ping Pulse & Line Stability Monitor Modal -->
+  <div id="monitorBackdrop" class="backdrop" hidden></div>
+  <div id="monitorModal" class="monitor-modal" role="dialog" aria-modal="true" aria-label="Line Stability Monitor" hidden>
+    <header class="monitor-head">
+      <div class="monitor-head-title">
+        <h2>Ping Pulse · Line Stability Monitor</h2>
+        <span class="monitor-live-dot" title="Live Heartbeat"></span>
+      </div>
+      <button type="button" id="monitorClose" class="btn btn-icon" aria-label="Close monitor dialog">✕</button>
+    </header>
+    <div class="monitor-hud" id="monitorStats"></div>
+    <div class="monitor-scope-wrap">
+      <canvas id="monitorCanvas"></canvas>
+    </div>
+    <div class="monitor-ctrls">
+      <button type="button" id="monitorToggleBtn" class="btn btn-primary">Pause</button>
+      <button type="button" id="monitorClearBtn" class="btn btn-ghost">Clear Log</button>
+      <button type="button" id="monitorExportBtn" class="btn btn-ghost">Export CSV</button>
+    </div>
+    <div class="monitor-log-title">Anomaly &amp; Packet Drop Event Log</div>
+    <div class="monitor-list" id="monitorList">
+      <p class="monitor-empty">No anomalies recorded. Line is steady.</p>
+    </div>
+  </div>
 
   <p id="srStatus" class="sr-only" role="status" aria-live="polite"></p>
 
